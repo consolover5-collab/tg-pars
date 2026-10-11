@@ -53,7 +53,7 @@ class ExtraRecipient(BaseModel):
 class ActionsConfig(BaseModel):
     notify_chat_id: str | int = "me"
     extra_notify: list[ExtraRecipient] = Field(default_factory=list)
-    auto_dm: bool = True
+    auto_dm: bool = False
     forward_to_main_bot: bool = False
     forward_mode: ForwardMode = ForwardMode.NOTIFY_WITH_META
     dm_template: str = "Привет! {type} ещё доступна? Цена: {price}. Ссылка: {link}"
