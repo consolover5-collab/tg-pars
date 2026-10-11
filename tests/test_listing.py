@@ -75,8 +75,19 @@ def test_fingerprint_keeps_model_numbers():
 def test_fingerprint_price_markers():
     base = text_fingerprint("Колонка JBL")
     for variant in ("Колонка JBL 50€", "Колонка JBL €50", "Колонка JBL 50 eur",
-                    "Колонка JBL 5к", "Колонка JBL 3000 руб", "Колонка JBL 15 тыс", "Колонка JBL 30₽"):
+                    "Колонка JBL 3000 руб", "Колонка JBL 15 тыс", "Колонка JBL 30₽"):
         assert text_fingerprint(variant) == base, variant
+
+
+@pytest.mark.parametrize("a, b", [
+    ("Samsung 4K 200€", "Samsung 8K 300€"),
+    ("Кроссовки Nike 42р 50€", "Кроссовки Nike 44р 50€"),
+    ("Телевизор 55 дюймов 4k", "Телевизор 55 дюймов 8k"),
+    ("Монитор 2к 150€", "Монитор 4к 150€"),
+])
+def test_fingerprint_keeps_sizes_and_resolutions(a, b):
+    """«р», «к», «k» после числа — размер/разрешение, не цена: разные объявления не склеиваются."""
+    assert text_fingerprint(a) != text_fingerprint(b)
 
 
 def test_fingerprint_emoji_and_markup_are_noise():
