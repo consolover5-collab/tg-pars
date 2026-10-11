@@ -157,7 +157,8 @@ class MessageProcessor:
         if mode == ForwardMode.FORWARD_RAW:
             return None
 
-        price_str = f"{meta.get('price', 0):,} ₽".replace(",", " ") if meta.get("price") else "—"
+        # валюта в объявлении не определяется (барахолки в €, парсер цены берёт и ₽, и €) — без значка
+        price_str = f"{meta.get('price', 0):,}".replace(",", " ") if meta.get("price") else "—"
 
         text = (
             f"🔔 Новое совпадение!\n"
@@ -167,6 +168,9 @@ class MessageProcessor:
             f"👤 Автор: {meta.get('author', '')}\n"
             f"🔗 {meta.get('link', '')}"
         )
+
+        if meta.get("price_drop_from"):
+            text += f"\n📉 цена снижена: было {meta['price_drop_from']:,}".replace(",", " ")
 
         if meta.get("message_snippet"):
             text += f"\n💬 {meta['message_snippet'][:200]}"

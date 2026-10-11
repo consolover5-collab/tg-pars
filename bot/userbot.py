@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 import time
+from contextlib import asynccontextmanager
 
 from telethon import TelegramClient, events
 from telethon import errors
@@ -18,6 +19,8 @@ from bot.models import Config, ForwardMode
 from bot.keywords import KeywordMatcher
 from bot.price import extract_price
 from bot.dedup import DedupChecker
+from bot.listing import RepeatVerdict, is_scam_list, judge_repeat, text_fingerprint
+from bot.llm import LLMClient, get_client
 from bot.ratelimit import RateLimiter
 from bot.vision import analyse_image, build_vision_prompt, parse_vision_response
 from bot.nlp import analyse_text, generate_dm, looks_like_listing, is_not_listing
@@ -38,13 +41,14 @@ class Userbot:
         vision_limiter: RateLimiter,
         db: Database,
         notify_callback=None,
+        llm: LLMClient | None = None,
     ):
         self.config = config
         self.dedup = dedup
         self.dm_limiter = dm_limiter
         self.vision_limiter = vision_limiter
         self.db = db
-        self.notify = notify_callback  # async fn(text: str, matched_keyword: str = "")
+        self.notify = notify_callback  # async fn(text, matched_keyword="") -> bool: дошло ли владельцу
         self.matcher = KeywordMatcher(
             config.monitoring.keywords,
             keyword_map=config.rules.keyword_map,
@@ -53,8 +57,13 @@ class Userbot:
             max_tokens=config.monitoring.text_nlp_per_minute,
             period_seconds=60.0,
         )
+        self.llm = llm or get_client(config.vision)  # общий клиент Groq: пауза и минутный лимитер
+        self.apply_rate_limits()
         self.paused = False
         self.processor = MessageProcessor(config, db)
+        # (seller_id, text_fp) -> [Lock, число ждущих]: кросспост приходит в 2–4 чата
+        # одновременно, проверка повтора и запись уведомления идут под замком ключа
+        self._listing_locks: dict[tuple[int, str], list] = {}
 
         self.client = TelegramClient(
             config.telegram.session_name,
@@ -75,6 +84,16 @@ class Userbot:
         self._phone_code_requested_at: float | None = None
         self._last_code_delivery: str | None = None
         self._last_code_timeout: int | None = None
+
+    def apply_rate_limits(self):
+        """Применить лимиты из конфига к живым лимитерам (меню «Лимиты» вызывает без рестарта)."""
+        self.dm_limiter.max_tokens = self.config.rate_limits.dm_per_hour
+        self.vision_limiter.max_tokens = self.config.rate_limits.vision_per_minute
+        self.nlp_limiter.max_tokens = self.config.monitoring.text_nlp_per_minute
+        # общий лимитер Groq; vision_per_minute и text_nlp_per_minute остаются подлимитами
+        self.llm.limiter.max_tokens = (
+            self.config.rate_limits.vision_per_minute + self.config.monitoring.text_nlp_per_minute
+        )
 
     async def start(self) -> bool:
         if self._started:
@@ -328,6 +347,14 @@ class Userbot:
             return
         seller_username = getattr(msg.sender, 'username', None) if msg.sender else None
 
+        # Step 0: ЧС и скам-рассылки — до ключей и Groq, чтобы скам не тратил дневную квоту
+        if not self.processor.should_process_user(seller_id, seller_username):
+            await self._drop_early(msg, seller_id, "blocklist")
+            return
+        if is_scam_list(msg.text or ""):
+            await self._drop_early(msg, seller_id, "scam")
+            return
+
         chat = await self._chat_title(msg)
         chat_external = str(msg.chat_id)
         match_type = None
@@ -358,7 +385,7 @@ class Userbot:
         if not match_type and msg.text and self.config.monitoring.use_text_nlp:
             if looks_like_listing(msg.text):
                 targets = self.config.monitoring.keywords or list(self.config.rules.keyword_map.keys())
-                nlp = await analyse_text(msg.text, targets, self.config, self.nlp_limiter)
+                nlp = await analyse_text(msg.text, targets, self.config, self.nlp_limiter, llm=self.llm)
                 if nlp and nlp["match"]:
                     match_type = "nlp"
                     matched_value = nlp["type"] or targets[0] if targets else "товар"
@@ -411,7 +438,7 @@ class Userbot:
             meta=meta
         )
 
-        # Step 4: dedup check (bypass for no_dedup_ids)
+        # Step 4: повтор того же объявления (bypass for no_dedup_ids)
         _no_dedup_ids = self.config.actions.no_dedup_ids or []
         no_dedup = seller_id in _no_dedup_ids
         if not no_dedup and seller_username:
@@ -420,62 +447,136 @@ class Userbot:
                 isinstance(e, str) and e.lstrip('@').lower() == _un
                 for e in _no_dedup_ids
             )
-        is_dup = False if no_dedup else await self.dedup.is_seen(
+        text = msg.text or ""
+        text_fp = text_fingerprint(text)
+        # замок на (продавец, текст): кросспосты одного объявления идут по очереди;
+        # без текста подавлять нечего — замок не нужен
+        lock_key = (seller_id, text_fp) if text_fp and not no_dedup else None
+        async with self._listing_lock(lock_key):
+            if no_dedup:
+                verdict = RepeatVerdict(text_fp=text_fp)
+            else:
+                verdict = await judge_repeat(
+                    self.db, seller_id, text, price, self.config.monitoring.dedup_window_days,
+                )
+
+            if verdict.repeat:
+                await self.db.add_notified(
+                    seller_id, matched_value, text_fp, price, msg.chat_id, msg.id,
+                    delivered=False, suppressed=True, reason="repeat",
+                )
+                await self.dedup.record_match(
+                    seller_id, msg.chat_id, msg.id,
+                    match_type, matched_value, price, is_duplicate=True,
+                )
+                await self.db.log_action(
+                    msg_uuid, "duplicate", "skipped", {"reason": "same listing already delivered"}
+                )
+                logger.info("Repeat suppressed: seller %s, chat %s, msg %s", seller_id, msg.chat_id, msg.id)
+                return
+
+            await self._deliver_match(
+                msg, msg_uuid, meta, no_dedup, verdict, nlp_dm_text, seller_username, chat_external,
+            )
+
+    async def _deliver_match(
+        self, msg: Message, msg_uuid: str, meta: dict, no_dedup: bool,
+        verdict: RepeatVerdict, nlp_dm_text: str | None, seller_username: str | None,
+        chat_external: str,
+    ):
+        """Уведомление/DM/пересылка по находке и запись итога в `notified`."""
+        seller_id = msg.sender_id
+        matched_value = meta["matched_value"]
+        match_type = meta["match_type"]
+        price = meta["price"]
+        if verdict.price_drop_from:
+            meta["price_drop_from"] = verdict.price_drop_from
+
+        # Кулдаун DM — свой: продавцу, которому писали, второй раз не пишем,
+        # но другое объявление (или сниженная цена) владельцу всё равно показываем.
+        dm_cooldown = False if no_dedup else await self.dedup.is_seen(
             seller_id, cooldown_hours=self.config.actions.dm_cooldown_hours
         )
 
-        if is_dup:
-            await self.dedup.record_match(
-                seller_id, msg.chat_id, msg.id,
-                match_type, matched_value, price, is_duplicate=True,
-            )
-            await self._notify_duplicate(chat, seller_id)
-            await self.db.log_action(msg_uuid, "duplicate", "skipped", {"reason": "seller in cooldown"})
-        else:
+        if not dm_cooldown:
             # Всегда регистрируем продавца: matches.seller_id ссылается на seen_sellers
             # (FK enforced), а кулдаун для no_dedup-продавцов всё равно не проверяется.
             await self.dedup.register(
-                seller_id, chat, msg.id, match_type, matched_value, price,
+                seller_id, meta["chat_title"], msg.id, match_type, matched_value, price,
             )
-            await self.dedup.record_match(
-                seller_id, msg.chat_id, msg.id,
-                match_type, matched_value, price, is_duplicate=False,
+        await self.dedup.record_match(
+            seller_id, msg.chat_id, msg.id,
+            match_type, matched_value, price, is_duplicate=False,
+        )
+
+        # Decide actions
+        actions = self.processor.decide_actions(chat_external, seller_id, meta, username=seller_username)
+        if dm_cooldown and actions.get("should_dm"):
+            actions = dict(actions, should_dm=False)
+
+        # Override DM text with Groq-generated version if applicable
+        if actions.get("should_dm") and self.config.actions.use_groq_dm:
+            groq_text = nlp_dm_text  # already generated during NLP step
+            if not groq_text:
+                groq_text = await generate_dm(
+                    msg.text or matched_value, matched_value, self.config, price=price, llm=self.llm,
+                )
+            if groq_text:
+                actions = dict(actions, dm_text=groq_text)
+
+        dm_sent = False
+        forward_sent = False
+
+        if actions["should_forward"]:
+            forward_sent = await self._forward_message(msg, meta, matched_keyword=matched_value)
+            await self.db.log_action(
+                msg_uuid, "forward",
+                "success" if forward_sent else "failed",
+                {"mode": self.config.actions.forward_mode.value, "dry_run": self.config.actions.dry_run}
             )
 
-            # Decide actions
-            actions = self.processor.decide_actions(chat_external, seller_id, meta, username=seller_username)
+        if actions["should_dm"]:
+            dm_sent = await self._send_dm_with_template(seller_id, actions["dm_text"])
+            await self.db.log_action(
+                msg_uuid, "dm",
+                "success" if dm_sent else "failed",
+                {"template_used": True, "groq_dm": self.config.actions.use_groq_dm,
+                 "dry_run": self.config.actions.dry_run}
+            )
 
-            # Override DM text with Groq-generated version if applicable
-            if actions.get("should_dm") and self.config.actions.use_groq_dm:
-                groq_text = nlp_dm_text  # already generated during NLP step
-                if not groq_text:
-                    groq_text = await generate_dm(
-                        msg.text or matched_value, matched_value, self.config, price=price
-                    )
-                if groq_text:
-                    actions = dict(actions, dm_text=groq_text)
+        delivered = await self._notify_new(meta, dm_sent, forward_sent)
+        # Недоставленное повтором не считается: delivered=0 окно не открывает
+        await self.db.add_notified(
+            seller_id, matched_value, verdict.text_fp, price, msg.chat_id, msg.id,
+            delivered=delivered, suppressed=False,
+            reason="price_drop" if verdict.price_drop_from else ("" if delivered else "undelivered"),
+        )
 
-            dm_sent = False
-            forward_sent = False
+    async def _drop_early(self, msg: Message, seller_id: int, reason: str):
+        """Сообщение отсеяно до разбора (ЧС, скам): молча, строка в лог и в `notified` для heartbeat."""
+        logger.info("Dropped %s message: seller %s, chat %s, msg %s", reason, seller_id, msg.chat_id, msg.id)
+        try:
+            await self.db.add_notified(
+                seller_id, None, text_fingerprint(msg.text or ""), None, msg.chat_id, msg.id,
+                delivered=False, suppressed=True, reason=reason,
+            )
+        except Exception:
+            logger.exception("Cannot record dropped message (%s)", reason)
 
-            if actions["should_forward"]:
-                forward_sent = await self._forward_message(msg, meta, matched_keyword=matched_value)
-                await self.db.log_action(
-                    msg_uuid, "forward",
-                    "success" if forward_sent else "failed",
-                    {"mode": self.config.actions.forward_mode.value, "dry_run": self.config.actions.dry_run}
-                )
-
-            if actions["should_dm"]:
-                dm_sent = await self._send_dm_with_template(seller_id, actions["dm_text"])
-                await self.db.log_action(
-                    msg_uuid, "dm",
-                    "success" if dm_sent else "failed",
-                    {"template_used": True, "groq_dm": self.config.actions.use_groq_dm,
-                     "dry_run": self.config.actions.dry_run}
-                )
-
-            await self._notify_new(meta, dm_sent, forward_sent)
+    @asynccontextmanager
+    async def _listing_lock(self, key: tuple[int, str] | None):
+        if key is None:
+            yield
+            return
+        entry = self._listing_locks.setdefault(key, [asyncio.Lock(), 0])
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0:
+                self._listing_locks.pop(key, None)
 
     # ── Vision ─────────────────────────────────────────────────────
 
@@ -489,6 +590,11 @@ class Userbot:
             if not looks_like_listing(caption):
                 logger.debug("Vision skipped: caption has no listing signal")
                 return None
+
+        if self.llm.is_blocked():
+            # дневной лимит Groq исчерпан: не качаем фото и не тратим токены лимитера
+            self.llm.note_skip()
+            return None
 
         if not self.vision_limiter.consume():
             logger.debug("Vision rate limit reached, skipping")
@@ -505,6 +611,7 @@ class Userbot:
                 photo_bytes,
                 prompt,
                 self.config.vision,
+                llm=self.llm,
             )
             return parse_vision_response(reply) if reply else None
         except Exception as e:
@@ -578,7 +685,10 @@ class Userbot:
                 # Send notification with metadata
                 notification_text = self.processor.format_notification(meta, self.config.actions.forward_mode)
                 if notification_text and self.notify:
-                    await self.notify(notification_text, matched_keyword=matched_keyword)
+                    ok = await self.notify(notification_text, matched_keyword=matched_keyword)
+                    if ok is False:   # None у старых колбэков — считаем доставленным
+                        logger.warning("Notification not delivered to owner")
+                        return False
                     logger.info("Notification sent")
                     return True
                 return False
@@ -591,10 +701,11 @@ class Userbot:
 
     # ── Notifications ──────────────────────────────────────────────
 
-    async def _notify_new(self, meta: dict, dm_sent: bool, forward_sent: bool):
+    async def _notify_new(self, meta: dict, dm_sent: bool, forward_sent: bool) -> bool:
+        """Уведомить владельца. True — дошло (или уже дошло пересылкой)."""
         # In notify_with_meta mode, _forward_message already sent a full notification
         if forward_sent and self.config.actions.forward_mode == ForwardMode.NOTIFY_WITH_META:
-            return
+            return True
         text = self.processor.format_notification(meta, ForwardMode.NOTIFY_WITH_META)
         extra = []
         if dm_sent:
@@ -603,17 +714,10 @@ class Userbot:
             extra.append("📤 Переслано")
         if extra:
             text += "\n" + "\n".join(extra)
-        if self.notify:
-            await self.notify(text, matched_keyword=meta.get("matched_value") or "")
-
-    async def _notify_duplicate(self, chat, seller_id):
-        text = (
-            f"🔄 Повтор от того же продавца\n"
-            f"📍 Чат: {chat}\n"
-            f"ℹ️ DM уже отправлялся ранее"
-        )
-        if self.notify:
-            await self.notify(text)  # no matched_keyword → only owner gets it
+        if not self.notify:
+            return forward_sent
+        ok = await self.notify(text, matched_keyword=meta.get("matched_value") or "")
+        return forward_sent or ok is not False
 
     # ── Validation ──────────────────────────────────────────────────
 
