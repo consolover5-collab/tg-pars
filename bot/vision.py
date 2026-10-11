@@ -2,16 +2,8 @@
 
 import base64
 import logging
-import time
 
-import aiohttp
-
-from bot.http import post_with_retry
-
-# Last known Groq rate-limit state, populated from response headers.
-# Zero extra API calls — updated on every Vision response.
-_groq_rate_info: dict = {}
-
+from bot.llm import get_client
 from bot.models import VisionConfig
 
 logger = logging.getLogger(__name__)
@@ -31,13 +23,13 @@ async def analyse_image(
     prompt: str,
     config: VisionConfig,
     timeout: float = 30.0,
+    llm=None,
 ) -> str | None:
     """Send image to Groq Vision and return the model's text reply (or None on error)."""
     b64 = base64.b64encode(image_bytes).decode()
-
-    payload = {
-        "model": config.model,
-        "messages": [
+    llm = llm or get_client(config)
+    return await llm.chat(
+        [
             {
                 "role": "user",
                 "content": [
@@ -49,39 +41,11 @@ async def analyse_image(
                 ],
             }
         ],
-        "max_tokens": 256,
-        "temperature": 0.2,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {config.api_key}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with post_with_retry(
-            config.base_url,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                logger.error("Vision API error %s: %s", resp.status, body[:300])
-                return None
-            _groq_rate_info.update({
-                "limit_requests":     resp.headers.get("x-ratelimit-limit-requests"),
-                "remaining_requests": resp.headers.get("x-ratelimit-remaining-requests"),
-                "limit_tokens":       resp.headers.get("x-ratelimit-limit-tokens"),
-                "remaining_tokens":   resp.headers.get("x-ratelimit-remaining-tokens"),
-                "reset_requests":     resp.headers.get("x-ratelimit-reset-requests"),
-                "updated_at":         time.monotonic(),
-            })
-            data = await resp.json()
-            return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error("Vision API request failed: %s", e)
-        return None
+        max_tokens=256,
+        temperature=0.2,
+        kind="vision",
+        timeout=timeout,
+    )
 
 
 def parse_vision_response(text: str) -> dict | None:
