@@ -1,0 +1,2172 @@
+"""aiogram Telegram bot — control panel UI for tg-parsing."""
+
+import asyncio
+import json
+import logging
+import io
+import os
+import re
+from datetime import datetime, timedelta, timezone
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+from bot.models import Config
+from bot.nlp import classify_user_input, expand_synonyms
+from db.database import Database
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+# ── Owner-only access gate ─────────────────────────────────────────
+# Registered first so it is the outermost middleware on both observers:
+# for anyone but the owner, nothing else in this module (including
+# clear_awaiting_on_callback below and every handler) ever runs.
+
+def _is_start_command(event: Message | CallbackQuery) -> bool:
+    """True if `event` is a /start message (allowed while owner_id is unset)."""
+    text = getattr(event, "text", None)
+    if not text:
+        return False
+    command = text.strip().split()[0].split("@")[0]
+    return command == "/start"
+
+
+@router.message.outer_middleware()
+@router.callback_query.outer_middleware()
+async def owner_only(handler, event: Message | CallbackQuery, data: dict):
+    """Silently drop any update that isn't from the bound owner.
+
+    - No `from_user` (e.g. channel posts) -> ignored.
+    - owner_id not captured yet -> only /start passes (it captures the
+      owner, see cmd_start); everything else is ignored.
+    - owner_id captured -> only that user's updates pass.
+    All drops are silent (no reply to the sender) and logged at debug level.
+    """
+    user = getattr(event, "from_user", None)
+    if user is None:
+        logger.debug("Ignoring update with no from_user")
+        return None
+
+    owner_id = _bot_instance.owner_id if _bot_instance else None
+    if owner_id is None:
+        if _is_start_command(event):
+            return await handler(event, data)
+        logger.debug("Ignoring update from %s: owner not set yet", user.id)
+        return None
+
+    if user.id != owner_id:
+        logger.debug("Ignoring update from non-owner %s", user.id)
+        return None
+
+    return await handler(event, data)
+
+
+@router.callback_query.outer_middleware()
+async def clear_awaiting_on_callback(handler, event: CallbackQuery, data: dict):
+    """Clear pending text-input state when user clicks any inline button."""
+    if _bot_instance and event.from_user:
+        _bot_instance.awaiting.pop(event.from_user.id, None)
+    return await handler(event, data)
+
+
+# Runtime references (set in ControlBot.setup)
+_bot_instance: "ControlBot | None" = None
+
+
+def _cfg() -> Config:
+    return _bot_instance.config
+
+
+def _db() -> Database:
+    return _bot_instance.db
+
+
+def _extract_chat_ref_from_message(message: Message) -> str | None:
+    origin = getattr(message, "forward_origin", None)
+    if origin:
+        chat = getattr(origin, "chat", None)
+        if chat:
+            username = getattr(chat, "username", None)
+            return f"@{username}" if username else str(chat.id)
+
+    fwd_chat = getattr(message, "forward_from_chat", None)
+    if fwd_chat:
+        username = getattr(fwd_chat, "username", None)
+        return f"@{username}" if username else str(fwd_chat.id)
+
+    return None
+
+
+def _normalize_chat_ref_input(text: str) -> str | None:
+    value = (text or "").strip()
+    if not value:
+        return None
+    # t.me/c/CHANNEL_ID/MSG_ID — private channel link
+    m = re.search(r"t\.me/c/(\d+)", value)
+    if m:
+        return f"-100{m.group(1)}"
+    # t.me/USERNAME — public channel link
+    m = re.search(r"t\.me/([A-Za-z0-9_]{5,64})", value)
+    if m:
+        return f"@{m.group(1)}"
+    # @username
+    if value.startswith("@"):
+        username = value[1:]
+        if re.fullmatch(r"[A-Za-z0-9_]{5,64}", username):
+            return f"@{username}"
+        return None
+    # Numeric chat ID
+    if re.fullmatch(r"-?\d+", value):
+        return value
+    return None
+
+
+async def _resolve_chat_title(chat_ref: str) -> str | None:
+    """Try to resolve a chat reference to its human-readable title via userbot."""
+    ub = _bot_instance.userbot if _bot_instance else None
+    if not ub or not ub.client.is_connected():
+        return None
+    try:
+        entity = await asyncio.wait_for(
+            ub.client.get_entity(int(chat_ref) if chat_ref.lstrip("-").isdigit() else chat_ref),
+            timeout=5.0,
+        )
+        return getattr(entity, "title", None) or getattr(entity, "username", None)
+    except (asyncio.TimeoutError, Exception) as e:
+        logger.debug("Could not resolve title for %s: %s", chat_ref, e)
+        return None
+
+
+def _display_chat_ref(chat_ref: str, title: str | None = None) -> str:
+    """Format chat ref for display: show title if available, especially for numeric IDs."""
+    if title:
+        if chat_ref.lstrip("-").isdigit():
+            return f"{title} ({chat_ref})"
+        return f"{title} [{chat_ref}]"
+    return chat_ref
+
+
+async def _handle_chat_add(message: Message, fallback_text: str = "") -> bool:
+    chat_ref = _extract_chat_ref_from_message(message)
+    if not chat_ref:
+        chat_ref = _normalize_chat_ref_input(fallback_text)
+    if not chat_ref:
+        await message.answer(
+            "❌ Не удалось определить чат из пересылки.\n"
+            "Если Telegram скрывает источник, введите @username, ссылку t.me/... или ID чата."
+        )
+        return False
+    if chat_ref in _cfg().monitoring.chats:
+        title = await _resolve_chat_title(chat_ref)
+        await message.answer(f"ℹ️ Чат {_display_chat_ref(chat_ref, title)} уже в списке.")
+        return True
+
+    title = await _resolve_chat_title(chat_ref)
+    display = _display_chat_ref(chat_ref, title)
+    _cfg().monitoring.chats.append(chat_ref)
+    await _save_config()
+    await _send_monitoring_screen(message, f"✅ Чат {display} добавлен.", apply_chats=True)
+    return True
+
+
+def _build_qr_png(link: str) -> bytes:
+    import qrcode
+
+    qr = qrcode.QRCode(border=2, box_size=8)
+    qr.add_data(link)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _build_qr_ascii(link: str) -> str:
+    import qrcode
+
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(link)
+    qr.make(fit=True)
+    return "\n".join(
+        "".join("██" if cell else "  " for cell in row)
+        for row in qr.get_matrix()
+    )
+
+
+async def _send_qr_image(message: Message, link: str) -> bool:
+    try:
+        png = await asyncio.to_thread(_build_qr_png, link)
+        await message.answer_photo(
+            BufferedInputFile(png, filename="userbot-login-qr.png"),
+            caption="📷 QR для авторизации userbot (действует ~2 минуты).",
+        )
+        return True
+    except Exception as e:
+        logger.warning("Failed to build/send QR image: %s", e)
+        try:
+            ascii_qr = await asyncio.to_thread(_build_qr_ascii, link)
+            await message.answer(
+                "📷 PNG-QR не отправился, отправляю текстовый QR:\n"
+                f"<pre>{ascii_qr}</pre>",
+                parse_mode="HTML",
+            )
+            return True
+        except Exception as e2:
+            logger.warning("Failed to send ASCII QR fallback: %s", e2)
+            return False
+
+
+# ── Keyboards ──────────────────────────────────────────────────────
+
+def _has_groq() -> bool:
+    return bool(_cfg().vision.api_key)
+
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    paused = _bot_instance and _bot_instance.userbot and _bot_instance.userbot.paused
+    pause_text = "▶️ Запуск" if paused else "⏸ Пауза"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📡 Мониторинг", callback_data="monitoring"),
+            InlineKeyboardButton(text="✉️ Авто-DM", callback_data="autodm"),
+        ],
+        [
+            InlineKeyboardButton(text="📋 История", callback_data="history"),
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
+        ],
+        [
+            InlineKeyboardButton(text=pause_text, callback_data="toggle_pause"),
+            InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
+        ],
+    ])
+
+
+def back_kb(target: str = "menu") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=target)],
+    ])
+
+
+# ── Dashboard helper ───────────────────────────────────────────────
+
+def _dashboard_text() -> tuple[str, int, int, str]:
+    chats_count = len(_cfg().monitoring.chats)
+    kw_count = len(_cfg().monitoring.keywords)
+    price = _cfg().monitoring.max_price
+    price_str = f"💰 до {price:,}".replace(",", " ") if price else ""
+    paused = _bot_instance and _bot_instance.userbot and _bot_instance.userbot.paused
+    ub_connected = _bot_instance and _bot_instance.userbot and _bot_instance.userbot.client.is_connected()
+    if paused:
+        status = "⏸ Пауза"
+    elif ub_connected:
+        status = "✅ Активен"
+    else:
+        status = "⚠️ Userbot offline"
+    return status, chats_count, kw_count, price_str
+
+
+async def _build_dashboard(stats: dict = None) -> str:
+    if not stats:
+        stats = await _db().get_stats()
+    status, chats_count, kw_count, price_str = _dashboard_text()
+    text = (
+        f"{status} | 📡 {chats_count} чат(ов) | 🔑 {kw_count} слов\n"
+        f"🔍 {stats['total_matches']} находок | ✉️ {stats['total_dms']} DM"
+    )
+    if price_str:
+        text += f" | {price_str}"
+    return text
+
+
+# ── /start ─────────────────────────────────────────────────────────
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    if _bot_instance.owner_id is None:
+        _bot_instance.owner_id = message.from_user.id
+        await _db().set_setting("owner_id", str(message.from_user.id))
+    text = await _build_dashboard()
+    await message.answer(text, reply_markup=main_menu_kb())
+
+
+# ── Menu callback ──────────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu")
+async def cb_menu(callback: CallbackQuery):
+    text = await _build_dashboard()
+    await callback.message.edit_text(text, reply_markup=main_menu_kb())
+    await callback.answer()
+
+
+# ── 📡 Мониторинг (chats + keywords + synonyms + price) ──────────
+
+def _format_keyword_short(kw: str) -> str:
+    """Format keyword with synonym count (compact view for monitoring screen)."""
+    kmap = _cfg().rules.keyword_map
+    val = kmap.get(kw)
+    count = len(val) if isinstance(val, list) else 0
+    if count:
+        return f"  • {kw}  <i>({count} син.)</i>"
+    return f"  • {kw}"
+
+
+def _format_keyword_with_synonyms(kw: str) -> str:
+    """Format keyword with its synonyms (full view)."""
+    kmap = _cfg().rules.keyword_map
+    val = kmap.get(kw)
+    if isinstance(val, list) and val:
+        syns = ", ".join(val)
+        return f"  • {kw} → {syns}"
+    return f"  • {kw}"
+
+
+async def _build_monitoring_screen(status_line: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Build monitoring screen text and keyboard. Returns (text, kb).
+
+    status_line: optional status prefix like "✅ Слово удалено" shown at top.
+    """
+    cfg = _cfg()
+    chats = cfg.monitoring.chats
+    keywords = cfg.monitoring.keywords
+    price = cfg.monitoring.max_price
+
+    parts = []
+    if status_line:
+        parts.append(status_line)
+        parts.append("")
+    parts.append("<b>📡 Мониторинг</b>\n")
+
+    if chats:
+        parts.append("📡 <b>Чаты:</b>")
+        for i, c in enumerate(chats):
+            if c.lstrip("-").isdigit():
+                title = await _resolve_chat_title(c)
+                parts.append(f"  {i+1}. {_display_chat_ref(c, title)}")
+            else:
+                parts.append(f"  {i+1}. {c}")
+    else:
+        parts.append("📡 Нет чатов")
+
+    parts.append("")
+    if keywords:
+        parts.append("🔑 <b>Ключевые слова:</b>")
+        for kw in keywords:
+            parts.append(_format_keyword_short(kw))
+    else:
+        parts.append("🔑 Нет ключевых слов")
+
+    price_str = f"{price:,}".replace(",", " ") if price else "без ограничений"
+    parts.append(f"\n💰 Макс. цена: {price_str}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Чат", callback_data="chat_add"),
+            InlineKeyboardButton(text="➖ Чат", callback_data="chat_del"),
+        ],
+        [
+            InlineKeyboardButton(text="➕ Слово", callback_data="kw_add"),
+            InlineKeyboardButton(text="➖ Слово", callback_data="kw_del"),
+        ],
+        [
+            InlineKeyboardButton(text="🏷 Синонимы", callback_data="synonyms"),
+            InlineKeyboardButton(text="💰 Цена", callback_data="max_price"),
+        ],
+        [
+            InlineKeyboardButton(text="📤 Экспорт слов", callback_data="kw_export"),
+            InlineKeyboardButton(text="📥 Импорт слов", callback_data="kw_import"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu")],
+    ])
+    return "\n".join(parts), kb
+
+
+async def _send_monitoring_screen(message, status_line: str = "", apply_chats: bool = False):
+    """Send updated monitoring screen as a new message (for use after text input actions).
+
+    If apply_chats=True, re-hook the Telethon NewMessage handler so the new
+    chat list takes effect immediately — no process restart.
+    """
+    text, kb = await _build_monitoring_screen(status_line)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    if apply_chats:
+        ub = _bot_instance.userbot if _bot_instance else None
+        applied = False
+        if ub and ub.client.is_connected():
+            try:
+                applied = await ub.update_monitored_chats()
+            except Exception:
+                logger.exception("update_monitored_chats failed")
+        if applied:
+            await message.answer("✅ Список чатов применён без перезапуска.")
+        else:
+            await message.answer(
+                "⚠️ Не удалось применить на лету. Настройки → Перезапуск бота."
+            )
+
+
+@router.callback_query(F.data == "monitoring")
+async def cb_monitoring(callback: CallbackQuery):
+    text, kb = await _build_monitoring_screen()
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+# ── Chats (sub of Мониторинг) ──────────────────────────────────────
+
+@router.callback_query(F.data == "chats")
+async def cb_chats(callback: CallbackQuery):
+    await cb_monitoring(callback)
+
+
+@router.callback_query(F.data == "chat_add")
+async def cb_chat_add(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "chat_add"
+    await callback.message.edit_text(
+        "Введите @username/ID чата или перешлите сообщение из нужного чата:",
+        reply_markup=back_kb("monitoring"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "chat_del")
+async def cb_chat_del(callback: CallbackQuery):
+    chats = _cfg().monitoring.chats
+    if not chats:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+    _bot_instance.awaiting[callback.from_user.id] = "chat_del"
+    lines = []
+    for i, c in enumerate(chats):
+        if c.lstrip("-").isdigit():
+            title = await _resolve_chat_title(c)
+            lines.append(f"  {i+1}. {_display_chat_ref(c, title)}")
+        else:
+            lines.append(f"  {i+1}. {c}")
+    await callback.message.edit_text(
+        "Введите номер чата для удаления:\n" + "\n".join(lines),
+        reply_markup=back_kb("monitoring"),
+    )
+    await callback.answer()
+
+
+# ── Keywords (sub of Мониторинг) ───────────────────────────────────
+
+@router.callback_query(F.data == "keywords")
+async def cb_keywords(callback: CallbackQuery):
+    await cb_monitoring(callback)
+
+
+@router.callback_query(F.data == "kw_add")
+async def cb_kw_add(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "kw_add"
+    await callback.message.edit_text(
+        "Введите ключевое слово для добавления:",
+        reply_markup=back_kb("monitoring"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "kw_del")
+async def cb_kw_del(callback: CallbackQuery):
+    kws = _cfg().monitoring.keywords
+    if not kws:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+    _bot_instance.awaiting[callback.from_user.id] = "kw_del"
+    lines = [f"  {i+1}. {k}" for i, k in enumerate(kws)]
+    await callback.message.edit_text(
+        "Введите номер слова для удаления:\n" + "\n".join(lines),
+        reply_markup=back_kb("monitoring"),
+    )
+    await callback.answer()
+
+
+# ── Synonyms ──────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "synonyms")
+async def cb_synonyms(callback: CallbackQuery):
+    kws = _cfg().monitoring.keywords
+    if not kws:
+        await callback.answer("Сначала добавьте ключевые слова", show_alert=True)
+        return
+
+    buttons = []
+    for kw in kws:
+        kmap = _cfg().rules.keyword_map
+        val = kmap.get(kw)
+        count = len(val) if isinstance(val, list) else 0
+        buttons.append([InlineKeyboardButton(
+            text=f"🏷 {kw} ({count} синонимов)",
+            callback_data=f"syn_show:{kw}",
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="monitoring")])
+
+    await callback.message.edit_text(
+        "🏷 <b>Синонимы</b>\nВыберите слово для управления синонимами:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+def _build_syn_show_screen(kw: str, status_line: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Build synonym list screen for a keyword. Returns (text, kb)."""
+    kmap = _cfg().rules.keyword_map
+    val = kmap.get(kw)
+    syns = val if isinstance(val, list) else []
+
+    parts = []
+    if status_line:
+        parts.append(status_line)
+        parts.append("")
+    if syns:
+        lines = [f"  {i+1}. {s}" for i, s in enumerate(syns)]
+        parts.append(f"🏷 <b>Синонимы для «{kw}»:</b>\n" + "\n".join(lines))
+    else:
+        parts.append(f"🏷 У слова «{kw}» нет синонимов.")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data=f"syn_add:{kw}"),
+            InlineKeyboardButton(text="➖ Удалить", callback_data=f"syn_del:{kw}"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="synonyms")],
+    ])
+    return "\n".join(parts), kb
+
+
+@router.callback_query(F.data.startswith("syn_show:"))
+async def cb_syn_show(callback: CallbackQuery):
+    kw = callback.data.split(":", 1)[1]
+    text, kb = _build_syn_show_screen(kw)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("syn_add:"))
+async def cb_syn_add(callback: CallbackQuery):
+    kw = callback.data.split(":", 1)[1]
+    _bot_instance.awaiting[callback.from_user.id] = f"syn_add:{kw}"
+    await callback.message.edit_text(
+        f"Введите синоним для «{kw}» (через запятую для нескольких):",
+        reply_markup=back_kb("synonyms"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("syn_del:"))
+async def cb_syn_del(callback: CallbackQuery):
+    kw = callback.data.split(":", 1)[1]
+    kmap = _cfg().rules.keyword_map
+    val = kmap.get(kw)
+    syns = val if isinstance(val, list) else []
+    if not syns:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+    _bot_instance.awaiting[callback.from_user.id] = f"syn_del:{kw}"
+    lines = [f"  {i+1}. {s}" for i, s in enumerate(syns)]
+    await callback.message.edit_text(
+        f"Введите номер для удаления:\n" + "\n".join(lines),
+        reply_markup=back_kb("synonyms"),
+    )
+    await callback.answer()
+
+
+# ── Max price (sub of Мониторинг) ──────────────────────────────────
+
+@router.callback_query(F.data == "max_price")
+async def cb_max_price(callback: CallbackQuery):
+    price = _cfg().monitoring.max_price
+    price_str = f"{price:,}".replace(",", " ") if price else "не задана"
+    _bot_instance.awaiting[callback.from_user.id] = "max_price"
+    await callback.message.edit_text(
+        f"💰 Макс. цена: {price_str}\nВведите новую максимальную цену (0 = без ограничений):",
+        reply_markup=back_kb("monitoring"),
+    )
+    await callback.answer()
+
+
+# ── 📋 История ────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "history")
+async def cb_history(callback: CallbackQuery):
+    rows = await _db().get_recent_matches(5)
+    if rows:
+        lines = []
+        for r in rows:
+            dup = "🔄" if r["is_duplicate"] else "🔔"
+            price_str = f"{r['price']:,}".replace(",", " ") if r.get("price") else "—"
+            lines.append(
+                f"{dup} {r['match_type']}({r.get('matched_value','')}) "
+                f"| {price_str} | {r['created_at'][-8:]}"
+            )
+        text = "<b>📋 История</b>\n\n" + "\n".join(lines)
+    else:
+        text = "<b>📋 История</b>\n\nПока нет совпадений."
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Все находки", callback_data="recent"),
+            InlineKeyboardButton(text="📜 Лог действий", callback_data="actions_log"),
+        ],
+        [InlineKeyboardButton(text="🧪 Тест pipeline", callback_data="test")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu")],
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "test")
+async def cb_test(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "test"
+    await callback.message.edit_text(
+        "🧪 Отправьте текст или фото для тестирования pipeline:",
+        reply_markup=back_kb("history"),
+    )
+    await callback.answer()
+
+
+# ── Recent matches ─────────────────────────────────────────────────
+
+@router.callback_query(F.data == "recent")
+async def cb_recent(callback: CallbackQuery):
+    rows = await _db().get_recent_matches(10)
+    if not rows:
+        text = "📋 Пока нет совпадений."
+    else:
+        lines = []
+        for r in rows:
+            dup = "🔄" if r["is_duplicate"] else "🔔"
+            price_str = f"{r['price']:,}".replace(",", " ") if r.get("price") else "—"
+            lines.append(
+                f"{dup} {r['match_type']}({r.get('matched_value','')}) "
+                f"| {price_str} | {r['created_at']}"
+            )
+        text = "📋 Последние находки:\n" + "\n".join(lines)
+
+    await callback.message.edit_text(text, reply_markup=back_kb("history"))
+    await callback.answer()
+
+
+# ── ⚙️ Настройки (adaptive: hides AI buttons without Groq key) ────
+
+@router.callback_query(F.data == "settings")
+async def cb_settings(callback: CallbackQuery):
+    cfg = _cfg()
+    notify = cfg.actions.notify_chat_id
+
+    buttons = []
+
+    # AI buttons — only if Groq key is set
+    if _has_groq():
+        vision_status = "вкл" if cfg.rules.vision_enabled else "выкл"
+        nlp_status = "вкл" if cfg.monitoring.use_text_nlp else "выкл"
+        buttons.append([
+            InlineKeyboardButton(text=f"👁 Vision: {vision_status}", callback_data="toggle_vision"),
+            InlineKeyboardButton(text=f"🧬 NLP: {nlp_status}", callback_data="toggle_text_nlp"),
+        ])
+
+    buttons.extend([
+        [
+            InlineKeyboardButton(text="📊 Лимиты", callback_data="limits"),
+            InlineKeyboardButton(text="👥 Списки", callback_data="lists"),
+        ],
+        [
+            InlineKeyboardButton(text="🔔 Уведомления", callback_data="set_notify"),
+            InlineKeyboardButton(text="🔐 Авторизация", callback_data="auth_userbot"),
+        ],
+        [
+            InlineKeyboardButton(text="🧪 Тест pipeline", callback_data="test"),
+            InlineKeyboardButton(text="🔄 Перезапуск", callback_data="restart_bot"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu")],
+    ])
+
+    parts = [f"⚙️ <b>Настройки</b>\n"]
+    if _has_groq():
+        parts.append(f"👁 Vision: {vision_status} | 🧬 NLP: {nlp_status}")
+    parts.append(f"🔔 Уведомления: {notify}")
+
+    await callback.message.edit_text(
+        "\n".join(parts),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "toggle_vision")
+async def cb_toggle_vision(callback: CallbackQuery):
+    _cfg().rules.vision_enabled = not _cfg().rules.vision_enabled
+    await _save_config()
+    status = "вкл" if _cfg().rules.vision_enabled else "выкл"
+    await callback.answer(f"Vision: {status}", show_alert=True)
+    await cb_settings(callback)
+
+
+def _build_notify_screen(status_line: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    extras = _cfg().actions.extra_notify
+    lines = ["🔔 <b>Получатели уведомлений</b>\n"]
+    if status_line:
+        lines.append(status_line + "\n")
+    lines.append("👤 Вы — все ключевые слова")
+    buttons = []
+    if extras:
+        lines.append("\n<b>Дополнительные:</b>")
+        for i, r in enumerate(extras):
+            kw_str = ", ".join(r.keywords) if r.keywords else "все"
+            lines.append(f"{i+1}. {r.name or r.user_id} — {kw_str}")
+            buttons.append([InlineKeyboardButton(
+                text=f"❌ {r.name or r.user_id}", callback_data=f"del_recipient:{i}"
+            )])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить получателя", callback_data="add_recipient")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="settings")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _send_notify_screen(message, status_line: str = ""):
+    text, kb = _build_notify_screen(status_line)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "set_notify")
+async def cb_set_notify(callback: CallbackQuery):
+    text, kb = _build_notify_screen()
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "add_recipient")
+async def cb_add_recipient(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "add_recipient_username"
+    await callback.message.edit_text(
+        "Введите @username или числовой user_id нового получателя:",
+        reply_markup=back_kb("set_notify"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("del_recipient:"))
+async def cb_del_recipient(callback: CallbackQuery):
+    idx = int(callback.data.split(":")[1])
+    extras = _cfg().actions.extra_notify
+    if 0 <= idx < len(extras):
+        removed = extras.pop(idx)
+        await _save_config()
+        await callback.answer(f"Удалён: {removed.name or removed.user_id}", show_alert=True)
+    await cb_set_notify(callback)
+
+
+@router.callback_query(F.data == "restart_bot")
+async def cb_restart_bot(callback: CallbackQuery):
+    import os, signal
+    await callback.answer("Перезапускаю…", show_alert=False)
+    await callback.message.edit_text("🔄 Перезапускаю бота, подождите ~10 секунд и откройте /start…")
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+@router.callback_query(F.data == "auth_userbot")
+async def cb_auth_userbot(callback: CallbackQuery):
+    if not _bot_instance.userbot:
+        await callback.answer("Userbot недоступен", show_alert=True)
+        return
+
+    await callback.answer()
+
+    try:
+        link = await _bot_instance.userbot.create_qr_login_link()
+    except Exception as e:
+        logger.error("Failed to generate userbot auth link: %s", e)
+        await callback.message.edit_text(
+            "❌ Не удалось подготовить авторизацию userbot.",
+            reply_markup=back_kb("settings"),
+        )
+        return
+
+    if not link:
+        started = await _bot_instance.userbot.start()
+        text = "✅ Userbot уже авторизован и запущен." if started else "✅ Userbot уже авторизован."
+        await callback.message.edit_text(text, reply_markup=back_kb("settings"))
+        return
+
+    await callback.message.edit_text(
+        "🔐 Подтвердите вход по QR или по ссылке ниже.\n"
+        "QR/ссылка одноразовые и действуют ~2 минуты.\n\n"
+        "⚠️ <b>Важно:</b> если у вас включена двухфакторная авторизация (2FA) в Telegram, "
+        "временно отключите её перед авторизацией, затем включите обратно.",
+        reply_markup=back_kb("settings"),
+        parse_mode="HTML",
+    )
+    sent_qr = await _send_qr_image(callback.message, link)
+    if not sent_qr:
+        await callback.message.answer("⚠️ Не удалось отправить QR-код изображением, использую ссылку.")
+    await callback.message.answer(f"🔗 {link}")
+    await callback.message.answer("⏳ Жду подтверждения авторизации...")
+
+    result = await _bot_instance.userbot.wait_qr_login(timeout=180)
+    if result == "ok":
+        started = await _bot_instance.userbot.start()
+        if started:
+            await callback.message.answer("✅ Авторизация успешна, мониторинг запущен.")
+        else:
+            await callback.message.answer("✅ Авторизация успешна, но запуск userbot не удался.")
+    elif result == "need_2fa":
+        await callback.message.answer(
+            "🔐 Для входа требуется пароль 2FA.\n\n"
+            "<b>Инструкция:</b>\n"
+            "1. Откройте Telegram → Настройки → Конфиденциальность → Двухэтапная аутентификация\n"
+            "2. Отключите пароль 2FA\n"
+            "3. Нажмите «🔐 Авторизация» ещё раз\n"
+            "4. После успешной авторизации включите 2FA обратно\n\n"
+            "Это безопасно — сессия userbot сохраняется, 2FA можно вернуть сразу.",
+            parse_mode="HTML",
+        )
+    elif result == "timeout":
+        try:
+            status = await _bot_instance.userbot.request_login_code()
+        except Exception:
+            status = "error"
+        if status == "already_authorized":
+            started = await _bot_instance.userbot.start()
+            msg = "✅ Userbot уже авторизован и запущен." if started else "✅ Userbot уже авторизован."
+            await callback.message.answer(msg)
+        elif status == "sent":
+            _bot_instance.awaiting[callback.from_user.id] = "auth_code"
+            await callback.message.answer(
+                "⌛ Ссылка не подтверждена вовремя. Переключаю на ввод кода вручную.\n"
+                "Введите код из сообщения от аккаунта Telegram:\n\n"
+                "⚠️ <b>Важно:</b> введите код <b>с пробелами</b>: <code>1 2 3 4 5</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await callback.message.answer("⌛ Время ожидания истекло. Нажмите «🔐 Авторизация» ещё раз.")
+    else:
+        await callback.message.answer("❌ Авторизация не завершена.")
+
+
+@router.callback_query(F.data == "auth_userbot_code")
+async def cb_auth_userbot_code(callback: CallbackQuery):
+    if not _bot_instance.userbot:
+        await callback.answer("Userbot недоступен", show_alert=True)
+        return
+
+    await callback.answer()
+    try:
+        status = await _bot_instance.userbot.request_login_code()
+    except Exception as e:
+        logger.error("Failed to request login code: %s", e)
+        await callback.message.edit_text("❌ Не удалось запросить код авторизации.", reply_markup=back_kb("settings"))
+        return
+
+    if status == "already_authorized":
+        started = await _bot_instance.userbot.start()
+        text = "✅ Userbot уже авторизован и запущен." if started else "✅ Userbot уже авторизован."
+        await callback.message.edit_text(text, reply_markup=back_kb("settings"))
+        return
+
+    _bot_instance.awaiting[callback.from_user.id] = "auth_code"
+    await callback.message.edit_text(
+        "🔢 Введите код из сообщения от аккаунта Telegram.\n"
+        "Код приходит в официальном Telegram (обычно не SMS).\n"
+        "Ваше сообщение с кодом будет удалено после обработки.\n\n"
+        "⚠️ <b>Важно:</b> введите код <b>с пробелами</b>: <code>1 2 3 4 5</code>\n"
+        "⚠️ Если у вас включена 2FA — временно отключите её перед авторизацией.",
+        reply_markup=back_kb("settings"),
+        parse_mode="HTML",
+    )
+
+
+# ── Pause / Resume ─────────────────────────────────────────────────
+
+@router.callback_query(F.data == "toggle_pause")
+async def cb_toggle_pause(callback: CallbackQuery):
+    if _bot_instance.userbot:
+        _bot_instance.userbot.paused = not _bot_instance.userbot.paused
+        status = "⏸ Приостановлен" if _bot_instance.userbot.paused else "▶️ Запущен"
+        await callback.answer(status, show_alert=True)
+    await cb_menu(callback)
+
+
+# ── ✉️ Авто-DM ────────────────────────────────────────────────────
+
+def _build_autodm_screen(status_line: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    cfg = _cfg()
+    auto_dm = "вкл" if cfg.actions.auto_dm else "выкл"
+    dry_run_status = "вкл" if cfg.actions.dry_run else "выкл"
+    delay_range = f"{cfg.actions.dm_delay_min}–{cfg.actions.dm_delay_max}с"
+    cooldown = cfg.actions.dm_cooldown_hours
+    tpl = cfg.actions.dm_template[:60] + "…" if len(cfg.actions.dm_template) > 60 else cfg.actions.dm_template
+
+    parts = [f"✉️ <b>Авто-DM</b>\n"]
+    if status_line:
+        parts.append(status_line + "\n")
+    parts.append(f"Статус: {auto_dm}")
+    if cfg.actions.dry_run:
+        parts.append("⚠️ <b>Dry-run включён</b> — DM не отправляются")
+    parts.append(f"📝 «{tpl}»")
+    parts.append(f"⏱ Задержка: {delay_range}")
+    parts.append(f"🔁 Повтор через: {cooldown} ч")
+
+    buttons = [
+        [InlineKeyboardButton(text=f"✉️ Авто-DM: {auto_dm}", callback_data="toggle_auto_dm")],
+        [InlineKeyboardButton(text="📝 Шаблон", callback_data="edit_dm_template")],
+        [
+            InlineKeyboardButton(text=f"⏱ Задержка: {delay_range}", callback_data="set_dm_delay"),
+            InlineKeyboardButton(text=f"🔁 Повтор: {cooldown}ч", callback_data="set_dm_cooldown"),
+        ],
+        [InlineKeyboardButton(text=f"🧪 Dry-run: {dry_run_status}", callback_data="toggle_dry_run")],
+    ]
+    if _has_groq():
+        groq_dm_status = "вкл" if cfg.actions.use_groq_dm else "выкл"
+        parts.append(f"🤖 Groq DM: {groq_dm_status}")
+        buttons.append([InlineKeyboardButton(text=f"🤖 Groq DM: {groq_dm_status}", callback_data="toggle_groq_dm")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu")])
+
+    return "\n".join(parts), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _send_autodm_screen(message, status_line: str = ""):
+    text, kb = _build_autodm_screen(status_line)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "autodm")
+async def cb_autodm(callback: CallbackQuery):
+    text, kb = _build_autodm_screen()
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+# redirect old actions_menu to autodm
+@router.callback_query(F.data == "actions_menu")
+async def cb_actions_menu(callback: CallbackQuery):
+    await cb_autodm(callback)
+
+
+@router.callback_query(F.data == "toggle_auto_dm")
+async def cb_toggle_auto_dm(callback: CallbackQuery):
+    _cfg().actions.auto_dm = not _cfg().actions.auto_dm
+    await _save_config()
+    status = "вкл" if _cfg().actions.auto_dm else "выкл"
+    await callback.answer(f"Авто-DM: {status}", show_alert=True)
+    await cb_autodm(callback)
+
+
+@router.callback_query(F.data == "toggle_dry_run")
+async def cb_toggle_dry_run(callback: CallbackQuery):
+    _cfg().actions.dry_run = not _cfg().actions.dry_run
+    await _save_config()
+    status = "вкл" if _cfg().actions.dry_run else "выкл"
+    await callback.answer(f"Dry-run: {status}", show_alert=True)
+    await cb_autodm(callback)
+
+
+@router.callback_query(F.data == "toggle_text_nlp")
+async def cb_toggle_text_nlp(callback: CallbackQuery):
+    _cfg().monitoring.use_text_nlp = not _cfg().monitoring.use_text_nlp
+    await _save_config()
+    status = "вкл" if _cfg().monitoring.use_text_nlp else "выкл"
+    await callback.answer(f"NLP: {status}", show_alert=True)
+    await cb_settings(callback)
+
+
+@router.callback_query(F.data == "toggle_groq_dm")
+async def cb_toggle_groq_dm(callback: CallbackQuery):
+    _cfg().actions.use_groq_dm = not _cfg().actions.use_groq_dm
+    await _save_config()
+    status = "вкл" if _cfg().actions.use_groq_dm else "выкл"
+    await callback.answer(f"Groq DM: {status}", show_alert=True)
+    await cb_autodm(callback)
+
+
+@router.callback_query(F.data == "set_dm_delay")
+async def cb_set_dm_delay(callback: CallbackQuery):
+    cfg = _cfg()
+    _bot_instance.awaiting[callback.from_user.id] = "set_dm_delay"
+    await callback.message.edit_text(
+        f"⏱ Текущая задержка: {cfg.actions.dm_delay_min}–{cfg.actions.dm_delay_max} с\n\n"
+        "Введите диапазон в формате <code>МИН МАКС</code> (в секундах), например:\n"
+        "<code>60 120</code> — от 1 до 2 минут\n"
+        "<code>30 60</code> — от 30 секунд до 1 минуты\n"
+        "<code>0 0</code> — без задержки",
+        reply_markup=back_kb("autodm"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "set_dm_cooldown")
+async def cb_set_dm_cooldown(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "set_dm_cooldown"
+    await callback.message.edit_text(
+        f"🔁 Текущий период повтора DM: {_cfg().actions.dm_cooldown_hours} ч\n\n"
+        "Введите количество часов (0 = никогда не повторять):",
+        reply_markup=back_kb("autodm"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "edit_dm_template")
+async def cb_edit_dm_template(callback: CallbackQuery):
+    current = _cfg().actions.dm_template
+    _bot_instance.awaiting[callback.from_user.id] = "edit_dm_template"
+    await callback.message.edit_text(
+        f"📝 Текущий шаблон DM:\n<code>{current}</code>\n\n"
+        "Плейсхолдеры: {type}, {price}, {link}, {author}, {chat_title}, {message_snippet}\n\n"
+        "Введите новый шаблон:",
+        reply_markup=back_kb("autodm"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+# ── 👥 Списки ─────────────────────────────────────────────────────
+
+def _build_lists_screen(status_line: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    opt_out = _cfg().rules.opt_out_list or []
+    no_dedup = _cfg().actions.no_dedup_ids or []
+
+    parts = ["👥 <b>Списки</b>\n"]
+    if status_line:
+        parts.append(status_line + "\n")
+    if opt_out:
+        lines = [f"  {i+1}. {uid}" for i, uid in enumerate(opt_out)]
+        parts.append("🚫 <b>Чёрный список</b> (не писать DM):\n" + "\n".join(lines))
+    else:
+        parts.append("🚫 Чёрный список: пуст")
+    if no_dedup:
+        lines = [f"  {i+1}. {uid}" for i, uid in enumerate(no_dedup)]
+        parts.append("\n✅ <b>Белый список</b> (игнор cooldown):\n" + "\n".join(lines))
+    else:
+        parts.append("\n✅ Белый список: пуст")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚫 Добавить в ЧС", callback_data="opt_out_add"),
+            InlineKeyboardButton(text="🚫 Убрать из ЧС", callback_data="opt_out_del"),
+        ],
+        [
+            InlineKeyboardButton(text="✅ Добавить в БС", callback_data="no_dedup_add"),
+            InlineKeyboardButton(text="✅ Убрать из БС", callback_data="no_dedup_del"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")],
+    ])
+    return "\n".join(parts), kb
+
+
+async def _send_lists_screen(message, status_line: str = ""):
+    text, kb = _build_lists_screen(status_line)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "lists")
+async def cb_lists(callback: CallbackQuery):
+    text, kb = _build_lists_screen()
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+# redirect old callbacks
+@router.callback_query(F.data == "opt_out_list")
+async def cb_opt_out_list(callback: CallbackQuery):
+    await cb_lists(callback)
+
+@router.callback_query(F.data == "no_dedup_list")
+async def cb_no_dedup_list(callback: CallbackQuery):
+    await cb_lists(callback)
+
+
+@router.callback_query(F.data == "opt_out_add")
+async def cb_opt_out_add(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "opt_out_add"
+    await callback.message.edit_text(
+        "Введите user_id или @username для добавления в чёрный список:",
+        reply_markup=back_kb("lists"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "opt_out_del")
+async def cb_opt_out_del(callback: CallbackQuery):
+    opt_out = _cfg().rules.opt_out_list
+    if not opt_out:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+    _bot_instance.awaiting[callback.from_user.id] = "opt_out_del"
+    lines = [f"  {i+1}. {uid}" for i, uid in enumerate(opt_out)]
+    await callback.message.edit_text(
+        "Введите номер для удаления:\n" + "\n".join(lines),
+        reply_markup=back_kb("lists"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "no_dedup_add")
+async def cb_no_dedup_add(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "no_dedup_add"
+    await callback.message.edit_text(
+        "Введите user_id или @username для добавления в белый список:",
+        reply_markup=back_kb("lists"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "no_dedup_del")
+async def cb_no_dedup_del(callback: CallbackQuery):
+    ids = _cfg().actions.no_dedup_ids or []
+    if not ids:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+    _bot_instance.awaiting[callback.from_user.id] = "no_dedup_del"
+    lines = [f"  {i+1}. {uid}" for i, uid in enumerate(ids)]
+    await callback.message.edit_text(
+        "Введите номер для удаления:\n" + "\n".join(lines),
+        reply_markup=back_kb("lists"),
+    )
+    await callback.answer()
+
+
+# ── Actions Log ────────────────────────────────────────────────
+
+@router.callback_query(F.data == "actions_log")
+async def cb_actions_log(callback: CallbackQuery):
+    logs = await _db().get_actions_log(limit=20)
+    if not logs:
+        text = "📜 Лог действий пуст."
+    else:
+        lines = []
+        for log in logs:
+            icon = "✉️" if log["action_type"] == "dm" else "📤" if log["action_type"] == "forward" else "🔄"
+            result_icon = "✅" if log["result"] == "success" else "❌"
+            lines.append(
+                f"{icon} {result_icon} {log['action_type']} | {log['timestamp'][:16]}"
+            )
+        text = "📜 Последние действия:\n" + "\n".join(lines)
+
+    await callback.message.edit_text(text, reply_markup=back_kb("history"), parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data == "help")
+async def cb_help(callback: CallbackQuery):
+    text = (
+        "❓ <b>Справка</b>\n\n"
+        "Бот мониторит Telegram-чаты через userbot (Telethon). "
+        "При совпадении ключевого слова, синонима или распознавании товара на фото — "
+        "уведомляет вас и (опционально) отправляет DM продавцу.\n\n"
+
+        "<b>📡 Мониторинг</b>\n"
+        "• <b>Чаты</b> — добавить: <code>@username</code>, ссылка <code>t.me/...</code>, "
+        "числовой ID или пересылка сообщения. Приватные каналы: <code>t.me/c/ID/...</code>\n"
+        "• <b>Ключевые слова</b> — просто напишите название товара, "
+        "бот сам предложит синонимы через AI\n"
+        "• <b>Синонимы</b> — расширяют поиск: «колонка» → акустика, speaker, JBL. "
+        "Кнопка 🏷 — просмотр, добавление и удаление\n"
+        "• <b>Макс. цена</b> — фильтрация по цене (0 = выключено)\n"
+        "• <b>Импорт/Экспорт</b> — массовое редактирование слов через JSON\n"
+        "• Стемминг: «колонку» = «колонка» = «колонки»\n"
+        "• После изменения чатов бот перезапускается автоматически\n\n"
+
+        "<b>⏸ Пауза</b>\n"
+        "Приостанавливает мониторинг без потери настроек.\n\n"
+
+        "<b>✉️ Авто-DM</b>\n"
+        "• Вкл/выкл автоматической отправки сообщений продавцам\n"
+        "• <b>Шаблон</b> — переменные: <code>{type}</code> <code>{price}</code> <code>{link}</code>\n"
+        "• <b>Задержка</b> — случайная пауза перед отправкой (имитация живого)\n"
+        "• <b>Повтор</b> — cooldown: через N часов можно написать снова\n"
+        "• <b>Dry-run</b> — тестовый режим: находки видны, DM не отправляются\n"
+        "• <b>Groq DM</b> — AI-генерация персонализированных сообщений\n\n"
+
+        "<b>📋 История</b>\n"
+        "• <b>Все находки</b> — последние совпадения с ценой и типом\n"
+        "• <b>Лог действий</b> — все DM, пропуски, ошибки\n"
+        "• <b>Тест pipeline</b> — проверка текста/фото без реальной отправки\n\n"
+
+        "<b>⚙️ Настройки</b>\n"
+    )
+    if _has_groq():
+        text += (
+            "• 👁 <b>Vision</b> — распознавание товаров на фото (Groq API)\n"
+            "• 🧬 <b>NLP</b> — семантический анализ текста объявлений\n"
+        )
+    text += (
+        "• 📊 <b>Лимиты</b> — квоты DM/час, Vision/мин, NLP/мин\n"
+        "• 👥 <b>Списки</b> — чёрный (не писать) и белый (игнор cooldown)\n"
+        "  Принимают <code>@username</code> и числовой user_id\n"
+        "• 🔔 <b>Уведомления</b> — добавить получателей по @username, "
+        "каждому можно выбрать ключевые слова\n"
+        "• 🔐 <b>Авторизация</b> — привязка userbot по QR-коду\n"
+        "• 🔄 <b>Перезапуск</b> — мягкий перезапуск сервиса\n\n"
+
+        "<b>💡 Подсказки</b>\n"
+        "• Просто напишите название товара — бот добавит его как ключевое слово\n"
+        "• Перешлите сообщение из чата — бот добавит этот чат в мониторинг\n"
+        "• После любого действия экран обновляется автоматически\n"
+        "• Короткие сообщения (ок, да, нет) бот игнорирует"
+    )
+    await callback.message.edit_text(text, reply_markup=back_kb("menu"), parse_mode="HTML")
+    await callback.answer()
+
+
+# ── Limits ─────────────────────────────────────────────────────────
+
+def _build_limits_screen(status_line: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    from bot.vision import _groq_rate_info
+
+    cfg = _cfg()
+    dm = _bot_instance.dm_limiter
+    vis = _bot_instance.vision_limiter
+
+    dm_line = (
+        f"✉️ DM: {dm.remaining}/{dm.max_tokens} осталось в час"
+        if dm else "✉️ DM: недоступно"
+    )
+    vis_retry = f" (сброс через {vis.retry_after:.0f}с)" if vis and vis.retry_after > 0 else ""
+    vis_line = (
+        f"👁 Vision: {vis.remaining}/{vis.max_tokens} осталось в мин{vis_retry}"
+        if vis else "👁 Vision: недоступно"
+    )
+
+    if _groq_rate_info:
+        rem_req = _groq_rate_info.get("remaining_requests", "?")
+        lim_req = _groq_rate_info.get("limit_requests", "?")
+        rem_tok = _groq_rate_info.get("remaining_tokens", "?")
+        lim_tok = _groq_rate_info.get("limit_tokens", "?")
+        reset = _groq_rate_info.get("reset_requests", "?")
+        groq_lines = (
+            f"\n🌐 <b>Groq API</b> (данные из последнего ответа):\n"
+            f"  Запросы: {rem_req}/{lim_req}\n"
+            f"  Токены:  {rem_tok}/{lim_tok}\n"
+            f"  Сброс:   {reset}"
+        )
+    else:
+        groq_lines = "\n🌐 <b>Groq API</b>: нет данных (Vision ещё не вызывался)"
+
+    parts = [f"📊 <b>Лимиты</b>\n"]
+    if status_line:
+        parts.append(status_line + "\n")
+    parts.append(dm_line)
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"✉️ DM/час: {cfg.rate_limits.dm_per_hour}",
+            callback_data="edit_dm_limit",
+        )],
+    ]
+
+    if _has_groq():
+        parts.append(f"{vis_line}{groq_lines}")
+        buttons.append(
+            [InlineKeyboardButton(
+                text=f"👁 Vision/мин: {cfg.rate_limits.vision_per_minute}",
+                callback_data="edit_vision_limit",
+            )]
+        )
+        buttons.append(
+            [InlineKeyboardButton(
+                text=f"🧬 NLP/мин: {cfg.monitoring.text_nlp_per_minute}",
+                callback_data="edit_nlp_limit",
+            )]
+        )
+
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="settings")])
+    return "\n".join(parts), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _send_limits_screen(message, status_line: str = ""):
+    text, kb = _build_limits_screen(status_line)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "limits")
+async def cb_limits(callback: CallbackQuery):
+    text, kb = _build_limits_screen()
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "edit_dm_limit")
+async def cb_edit_dm_limit(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "edit_dm_limit"
+    await callback.message.edit_text(
+        f"✉️ Текущий лимит DM: {_cfg().rate_limits.dm_per_hour}/час\n"
+        "Введите новое значение:",
+        reply_markup=back_kb("limits"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "edit_vision_limit")
+async def cb_edit_vision_limit(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "edit_vision_limit"
+    await callback.message.edit_text(
+        f"👁 Текущий лимит Vision: {_cfg().rate_limits.vision_per_minute}/мин\n"
+        "Введите новое значение:",
+        reply_markup=back_kb("limits"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "edit_nlp_limit")
+async def cb_edit_nlp_limit(callback: CallbackQuery):
+    _bot_instance.awaiting[callback.from_user.id] = "edit_nlp_limit"
+    await callback.message.edit_text(
+        f"🧬 Текущий лимит NLP: {_cfg().monitoring.text_nlp_per_minute}/мин\n"
+        "Введите новое значение:",
+        reply_markup=back_kb("limits"),
+    )
+    await callback.answer()
+
+
+# ── AI helpers ────────────────────────────────────────────────────
+
+async def _propose_keyword(message: Message, kw: str, synonyms: list, is_new: bool = True) -> None:
+    """Expand synonyms via Groq then ask user to confirm/edit/cancel."""
+    cfg = _cfg()
+    all_synonyms = list(synonyms)
+    if cfg.vision.api_key:
+        await message.answer("🤔 Расширяю синонимы через AI...")
+        extra = await expand_synonyms(kw, all_synonyms, cfg)
+        all_synonyms = all_synonyms + [s for s in extra if s not in all_synonyms]
+    _bot_instance.pending_kw[message.from_user.id] = {
+        "kw": kw, "synonyms": all_synonyms, "is_new": is_new,
+    }
+    syns_str = "\n".join(f"  • {s}" for s in all_synonyms) if all_synonyms else "  —"
+    label = "Новый товар" if is_new else "Синонимы для"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сохранить", callback_data="kw_confirm"),
+         InlineKeyboardButton(text="❌ Отменить", callback_data="kw_decline")],
+        [InlineKeyboardButton(text="✏️ Редактировать", callback_data="kw_edit")],
+    ])
+    await message.answer(
+        f"<b>{label}: {kw}</b>\n\nСинонимы:\n{syns_str}\n\nСохранить?",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "kw_confirm")
+async def cb_kw_confirm(callback: CallbackQuery):
+    pending = _bot_instance.pending_kw.pop(callback.from_user.id, None)
+    if not pending:
+        await callback.answer("Нечего сохранять", show_alert=True)
+        return
+    await callback.answer()
+    kw, synonyms, is_new = pending["kw"], pending["synonyms"], pending.get("is_new", True)
+    cfg = _cfg()
+    kmap = cfg.rules.keyword_map
+    if kw not in kmap:
+        kmap[kw] = synonyms or [kw]
+    else:
+        for s in synonyms:
+            if s not in kmap[kw]:
+                kmap[kw].append(s)
+    if is_new and kw not in cfg.monitoring.keywords:
+        cfg.monitoring.keywords.append(kw)
+    await _save_config()
+    if _bot_instance.userbot:
+        _bot_instance.userbot.matcher.update(cfg.monitoring.keywords, keyword_map=cfg.rules.keyword_map)
+    if not is_new:
+        screen_text, kb = _build_syn_show_screen(kw, f"✅ Синонимы для «{kw}» обновлены")
+        await callback.message.edit_text(screen_text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await callback.message.edit_text(f"✅ Сохранено: <b>{kw}</b>", parse_mode="HTML")
+
+
+@router.callback_query(F.data == "kw_decline")
+async def cb_kw_decline(callback: CallbackQuery):
+    _bot_instance.pending_kw.pop(callback.from_user.id, None)
+    await callback.answer()
+    await callback.message.edit_text("❌ Добавление отменено.")
+
+
+@router.callback_query(F.data == "kw_edit")
+async def cb_kw_edit(callback: CallbackQuery):
+    pending = _bot_instance.pending_kw.get(callback.from_user.id)
+    if not pending:
+        await callback.answer("Нечего редактировать", show_alert=True)
+        return
+    await callback.answer()
+    syns_str = ", ".join(pending["synonyms"]) if pending["synonyms"] else ""
+    _bot_instance.awaiting[callback.from_user.id] = "kw_edit"
+    await callback.message.answer(
+        f"✏️ Отредактируйте синонимы для <b>{pending['kw']}</b> (через запятую):\n\n"
+        f"<code>{syns_str}</code>",
+        parse_mode="HTML",
+    )
+
+
+async def _smart_handle(message: Message, text: str) -> None:
+    """Handle free-form text with no awaiting state via Groq classification."""
+    if not text or not _bot_instance or not _cfg():
+        return
+    # Skip very short or trivial messages to avoid wasting Groq API credits
+    _TRIVIAL = {"ок", "ok", "да", "нет", "нет", "спасибо", "привет", "хорошо", "ладно", "понял", "👍", "👌", "🙏"}
+    if len(text) < 4 or text.lower() in _TRIVIAL:
+        return
+    cfg = _cfg()
+    if not cfg.vision.api_key:
+        await message.answer(
+            "💡 Не знаю что с этим делать.\n"
+            "Используйте кнопки меню или /start для навигации.",
+        )
+        return
+    await message.answer("🤔 Анализирую...")
+    result = await classify_user_input(text, cfg)
+    kind = result.get("type", "unknown")
+    if kind == "chat":
+        value = (result.get("value") or "").strip()
+        # Normalize handles t.me/c/ID, t.me/username, @username, numeric ID
+        validated = _normalize_chat_ref_input(value)
+        if not validated:
+            await message.answer(
+                f"❌ Не удалось распознать чат из: <b>{value}</b>\n"
+                "Поддерживаются: @username, t.me/username, t.me/c/ID/... или числовой ID.",
+                parse_mode="HTML",
+            )
+            return
+        title = await _resolve_chat_title(validated)
+        display = _display_chat_ref(validated, title)
+        if validated in cfg.monitoring.chats:
+            await message.answer(f"ℹ️ Чат {display} уже в списке мониторинга.")
+            return
+        cfg.monitoring.chats.append(validated)
+        await _save_config()
+        await _send_monitoring_screen(message, f"✅ Добавил {display}.", apply_chats=True)
+    elif kind == "keyword":
+        kw = (result.get("value") or "").strip().lower()
+        synonyms = [s.strip() for s in (result.get("synonyms") or []) if s.strip()]
+        if not kw:
+            await message.answer("❓ Не удалось определить ключевое слово. Попробуйте точнее.")
+            return
+        is_new = kw not in cfg.monitoring.keywords
+        await _propose_keyword(message, kw, synonyms, is_new=is_new)
+    else:
+        await message.answer(
+            "❓ Не понял что с этим делать.\n\n"
+            "Я понимаю:\n"
+            "• <b>@username</b> или ссылку на Telegram-чат → добавлю в мониторинг\n"
+            "• <b>Название товара</b> (колонка, телевизор…) → добавлю в ключевые слова\n\n"
+            "Или используйте кнопки меню.",
+            parse_mode="HTML",
+        )
+
+
+@router.callback_query(F.data == "kw_export")
+async def cb_kw_export(callback: CallbackQuery):
+    await callback.answer()
+    cfg = _cfg()
+    kmap = cfg.rules.keyword_map
+    kws = cfg.monitoring.keywords
+    if not kws:
+        await callback.message.answer("Нет ключевых слов для экспорта.")
+        return
+    lines = []
+    for kw in kws:
+        syns = kmap.get(kw)
+        if isinstance(syns, list) and syns:
+            lines.append(f"{kw}: {', '.join(syns)}")
+        else:
+            lines.append(kw)
+    export_text = "\n".join(lines)
+    await callback.message.answer(
+        "📤 <b>Экспорт ключевых слов</b>\n\n"
+        "Формат: <code>слово: синоним1, синоним2, ...</code>\n"
+        "Отредактируйте и импортируйте обратно кнопкой 📥\n\n"
+        "<code>" + export_text + "</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "kw_import")
+async def cb_kw_import(callback: CallbackQuery):
+    await callback.answer()
+    _bot_instance.awaiting[callback.from_user.id] = "kw_import"
+    await callback.message.answer(
+        "📥 <b>Импорт ключевых слов</b>\n\n"
+        "Вставьте список в формате:\n"
+        "<code>слово: синоним1, синоним2, ...</code>\n\n"
+        "Каждое слово — новая строка. "
+        "Существующие слова будут <b>заменены</b>, новые — добавлены.",
+        parse_mode="HTML",
+    )
+
+
+# ── Text input handler ─────────────────────────────────────────────
+
+@router.message(F.forward_origin | F.forward_from_chat)
+async def handle_forwarded_input(message: Message):
+    action = _bot_instance.awaiting.get(message.from_user.id)
+    if action == "chat_add":
+        _bot_instance.awaiting.pop(message.from_user.id, None)
+        text = (message.text or message.caption or "").strip()
+        ok = await _handle_chat_add(message, fallback_text=text)
+        if not ok:
+            _bot_instance.awaiting[message.from_user.id] = "chat_add"
+            return
+        await message.answer("Главное меню:", reply_markup=main_menu_kb())
+        return
+    if action:
+        return
+    chat_ref = _extract_chat_ref_from_message(message)
+    if chat_ref:
+        validated = _normalize_chat_ref_input(chat_ref) or chat_ref
+        title = await _resolve_chat_title(validated)
+        display = _display_chat_ref(validated, title)
+        if validated in _cfg().monitoring.chats:
+            await message.answer(f"ℹ️ Чат {display} уже в списке мониторинга.")
+            return
+        _cfg().monitoring.chats.append(validated)
+        await _save_config()
+        await _send_monitoring_screen(message, f"✅ Добавил {display}.", apply_chats=True)
+    else:
+        text = (message.text or message.caption or "").strip()
+        if text:
+            await message.answer(
+                "❓ Не могу определить источник форварда (скрыт автором).\n\n"
+                "Что вы хотите сделать?\n"
+                "• Чтобы добавить <b>чат</b> — введите @username вручную\n"
+                "• Чтобы добавить <b>товар</b> — нажмите ➕ Слово в Мониторинге",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📡 Мониторинг", callback_data="monitoring")],
+                ]),
+            )
+        else:
+            await message.answer(
+                "❓ Не могу определить источник этого форварда. Введите @username чата вручную."
+            )
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_text_input(message: Message):
+    action = _bot_instance.awaiting.pop(message.from_user.id, None)
+    if not action:
+        await _smart_handle(message, (message.text or "").strip())
+        return
+
+    text = (message.text or message.caption or "").strip()
+    if action in {"auth_code", "auth_2fa"}:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    if action == "chat_add":
+        ok = await _handle_chat_add(message, fallback_text=text)
+        if not ok:
+            _bot_instance.awaiting[message.from_user.id] = "chat_add"
+            return
+
+    elif action == "chat_del":
+        try:
+            idx = int(text) - 1
+            if idx < 0:
+                raise IndexError
+            removed = _cfg().monitoring.chats.pop(idx)
+            await _save_config()
+            title = await _resolve_chat_title(removed)
+            display = _display_chat_ref(removed, title)
+            await _send_monitoring_screen(message, f"✅ Чат {display} удалён.", apply_chats=True)
+        except (ValueError, IndexError):
+            await message.answer("❌ Неверный номер. Введите номер из списка.")
+        return
+
+    elif action == "kw_edit":
+        pending = _bot_instance.pending_kw.get(message.from_user.id)
+        if not pending:
+            await message.answer("❌ Сессия устарела, начните заново.")
+        else:
+            new_syns = [s.strip() for s in text.split(",") if s.strip()]
+            pending["synonyms"] = new_syns
+            syns_str = "\n".join(f"  • {s}" for s in new_syns) if new_syns else "  —"
+            label = "Новый товар" if pending.get("is_new") else "Синонимы для"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Сохранить", callback_data="kw_confirm"),
+                 InlineKeyboardButton(text="❌ Отменить", callback_data="kw_decline")],
+                [InlineKeyboardButton(text="✏️ Редактировать", callback_data="kw_edit")],
+            ])
+            await message.answer(
+                f"<b>{label}: {pending['kw']}</b>\n\nСинонимы:\n{syns_str}\n\nСохранить?",
+                parse_mode="HTML", reply_markup=kb,
+            )
+        return
+
+    elif action == "kw_import":
+        lines_in = [l.strip() for l in text.strip().splitlines() if l.strip()]
+        added, updated = [], []
+        cfg = _cfg()
+        for line in lines_in:
+            if ":" in line:
+                kw, _, rest = line.partition(":")
+                kw = kw.strip().lower()
+                syns = [s.strip() for s in rest.split(",") if s.strip()]
+            else:
+                kw = line.strip().lower()
+                syns = [kw]
+            if not kw:
+                continue
+            is_new = kw not in cfg.monitoring.keywords
+            cfg.rules.keyword_map[kw] = syns
+            if is_new:
+                cfg.monitoring.keywords.append(kw)
+                added.append(kw)
+            else:
+                updated.append(kw)
+        await _save_config()
+        if _bot_instance.userbot:
+            _bot_instance.userbot.matcher.update(
+                cfg.monitoring.keywords, keyword_map=cfg.rules.keyword_map
+            )
+        status_parts = []
+        if added:
+            status_parts.append(f"✅ Добавлено: {len(added)}")
+        if updated:
+            status_parts.append(f"🔄 Обновлено: {len(updated)}")
+        status = " | ".join(status_parts) if status_parts else "Ничего не импортировано."
+        await _send_monitoring_screen(message, status)
+        return
+
+    elif action == "kw_add":
+        kw = text.strip().lower()
+        is_new = kw not in _cfg().monitoring.keywords
+        await _propose_keyword(message, kw, [kw], is_new=is_new)
+        return
+
+    elif action == "kw_del":
+        try:
+            idx = int(text) - 1
+            if idx < 0:
+                raise IndexError
+            removed = _cfg().monitoring.keywords.pop(idx)
+            _cfg().rules.keyword_map.pop(removed, None)
+            await _save_config()
+            if _bot_instance.userbot:
+                _bot_instance.userbot.matcher.update(
+                    _cfg().monitoring.keywords,
+                    keyword_map=_cfg().rules.keyword_map,
+                )
+            await _send_monitoring_screen(message, f"✅ Слово «{removed}» удалено.")
+        except (ValueError, IndexError):
+            await message.answer("❌ Неверный номер. Введите номер из списка.")
+        return
+
+    elif action == "max_price":
+        try:
+            new_price = int(text.replace(" ", "").replace("₽", "").replace("р", "").replace("€", "").replace("$", ""))
+            _cfg().monitoring.max_price = new_price
+            await _save_config()
+            await _send_monitoring_screen(message, f"✅ Макс. цена: {new_price:,}".replace(",", " "))
+        except ValueError:
+            await message.answer("❌ Введите число.")
+        return
+
+    elif action == "add_recipient_username":
+        # Resolve username to user_id via Telethon
+        username = text.strip().lstrip("@")
+        user_id = None
+        display_name = username
+        if username.isdigit():
+            user_id = int(username)
+            display_name = str(user_id)
+        elif _bot_instance.userbot and _bot_instance.userbot.client.is_connected():
+            try:
+                entity = await _bot_instance.userbot.client.get_entity(username)
+                user_id = entity.id
+                display_name = getattr(entity, "first_name", "") or username
+            except Exception as e:
+                await message.answer(f"❌ Не удалось найти пользователя @{username}: {e}")
+                return
+        else:
+            await message.answer("❌ Userbot не подключён, введите числовой user_id.")
+            return
+        # Store pending and ask for keywords
+        _bot_instance.pending_kw[message.from_user.id] = {
+            "recipient_user_id": user_id,
+            "recipient_name": display_name,
+        }
+        _bot_instance.awaiting[message.from_user.id] = "add_recipient_keywords"
+        kw_list = ", ".join(_cfg().monitoring.keywords) or "(нет)"
+        await message.answer(
+            f"👤 {display_name} (ID: {user_id})\n\n"
+            f"Текущие ключевые слова: {kw_list}\n\n"
+            f"Введите ключевые слова через запятую (или «все» для всех):"
+        )
+        return
+
+    elif action == "add_recipient_keywords":
+        from bot.models import ExtraRecipient
+        pending = _bot_instance.pending_kw.pop(message.from_user.id, None)
+        if not pending:
+            await message.answer("❌ Ошибка, попробуйте заново.")
+            return
+        keywords = []
+        if text.strip().lower() != "все":
+            keywords = [k.strip() for k in text.split(",") if k.strip()]
+        recipient = ExtraRecipient(
+            user_id=pending["recipient_user_id"],
+            name=pending["recipient_name"],
+            keywords=keywords,
+        )
+        _cfg().actions.extra_notify.append(recipient)
+        await _save_config()
+        kw_str = ", ".join(keywords) if keywords else "все"
+        await _send_notify_screen(message, f"✅ Добавлен: {recipient.name} — {kw_str}")
+        return
+
+    elif action == "auth_code":
+        if not _bot_instance.userbot:
+            await message.answer("❌ Userbot недоступен.")
+        else:
+            result = await _bot_instance.userbot.sign_in_with_code(text)
+            if result == "ok":
+                started = await _bot_instance.userbot.start()
+                if started:
+                    await message.answer("✅ Авторизация успешна, мониторинг запущен.", reply_markup=back_kb("settings"))
+                else:
+                    await message.answer("✅ Авторизация успешна, но userbot не запущен.", reply_markup=back_kb("settings"))
+            elif result == "need_2fa":
+                _bot_instance.awaiting[message.from_user.id] = "auth_2fa"
+                await message.answer("🔐 Введите пароль 2FA:")
+                return
+            elif result == "invalid_code":
+                _bot_instance.awaiting[message.from_user.id] = "auth_code"
+                await message.answer("❌ Неверный код. Попробуйте ещё раз:")
+                return
+            elif result == "expired_code":
+                try:
+                    await _bot_instance.userbot.request_login_code()
+                    _bot_instance.awaiting[message.from_user.id] = "auth_code"
+                    await message.answer("⌛ Код истёк. Отправил новый, введите его:")
+                    return
+                except Exception:
+                    await message.answer("❌ Код истёк и не удалось запросить новый.", reply_markup=back_kb("settings"))
+            else:
+                await message.answer("❌ Не удалось авторизоваться по коду.", reply_markup=back_kb("settings"))
+
+    elif action == "auth_2fa":
+        # 2FA password input is no longer accepted for security
+        await message.answer(
+            "🔐 Ввод пароля 2FA через бота отключён по соображениям безопасности.\n\n"
+            "<b>Инструкция:</b>\n"
+            "1. Откройте Telegram → Настройки → Конфиденциальность → Двухэтапная аутентификация\n"
+            "2. Отключите пароль 2FA\n"
+            "3. Нажмите «🔐 Авторизация» ещё раз\n"
+            "4. После успешной авторизации включите 2FA обратно",
+            reply_markup=back_kb("settings"),
+            parse_mode="HTML",
+        )
+
+    elif action == "test":
+        from bot.keywords import KeywordMatcher
+        from bot.price import extract_price as ep
+        matcher = KeywordMatcher(
+            _cfg().monitoring.keywords,
+            keyword_map=_cfg().rules.keyword_map,
+        )
+        kw = matcher.match(text)
+        price = ep(text)
+        if kw:
+            resolved = matcher.resolve_key(kw) or kw
+            await message.answer(f"🧪 Результат:\n🏷 Keyword: {resolved}\n💰 Цена: {price or '—'}",
+                                 reply_markup=back_kb("history"))
+        else:
+            await message.answer("🧪 Результат: совпадений по тексту нет.",
+                                 reply_markup=back_kb("history"))
+
+    elif action == "edit_dm_template":
+        _cfg().actions.dm_template = text
+        await _save_config()
+        await _send_autodm_screen(message, f"✅ Шаблон обновлён")
+        return
+
+    elif action == "opt_out_add":
+        entry = text.strip()
+        if entry.startswith("@"):
+            if entry not in _cfg().rules.opt_out_list:
+                _cfg().rules.opt_out_list.append(entry)
+                await _save_config()
+                await _send_lists_screen(message, f"✅ {entry} добавлен в ЧС")
+            else:
+                await _send_lists_screen(message, f"⚠️ {entry} уже в списке")
+        else:
+            try:
+                user_id = int(entry)
+                if user_id not in _cfg().rules.opt_out_list:
+                    _cfg().rules.opt_out_list.append(user_id)
+                    await _save_config()
+                    await _send_lists_screen(message, f"✅ {user_id} добавлен в ЧС")
+                else:
+                    await _send_lists_screen(message, f"⚠️ {user_id} уже в списке")
+            except ValueError:
+                await message.answer("❌ Введите user_id (число) или @username")
+        return
+
+    elif action == "opt_out_del":
+        try:
+            idx = int(text) - 1
+            if idx < 0:
+                raise IndexError
+            removed = _cfg().rules.opt_out_list.pop(idx)
+            await _save_config()
+            await _send_lists_screen(message, f"✅ {removed} удалён из ЧС")
+        except (ValueError, IndexError):
+            await message.answer("❌ Неверный номер.")
+        return
+
+    elif action == "set_dm_delay":
+        parts = text.split()
+        try:
+            mn, mx = int(parts[0]), int(parts[1]) if len(parts) > 1 else int(parts[0])
+            if mn < 0 or mx < mn:
+                raise ValueError
+            _cfg().actions.dm_delay_min = mn
+            _cfg().actions.dm_delay_max = mx
+            await _save_config()
+            await _send_autodm_screen(message, f"✅ Задержка: {mn}–{mx} с")
+        except (ValueError, IndexError):
+            await message.answer("❌ Формат: МИН МАКС (числа, например: 60 120)")
+        return
+
+    elif action == "set_dm_cooldown":
+        try:
+            hours = int(text)
+            if hours < 0:
+                raise ValueError
+            _cfg().actions.dm_cooldown_hours = hours
+            await _save_config()
+            label = f"{hours} ч" if hours > 0 else "никогда"
+            await _send_autodm_screen(message, f"✅ Повтор DM: {label}")
+        except ValueError:
+            await message.answer("❌ Введите целое число часов (0 = никогда)")
+        return
+
+    elif action == "no_dedup_add":
+        entry = text.strip()
+        if entry.startswith("@"):
+            ids = _cfg().actions.no_dedup_ids
+            if entry not in ids:
+                ids.append(entry)
+                await _save_config()
+                await _send_lists_screen(message, f"✅ {entry} добавлен в БС")
+            else:
+                await _send_lists_screen(message, f"⚠️ {entry} уже в списке")
+        else:
+            try:
+                user_id = int(entry)
+                ids = _cfg().actions.no_dedup_ids
+                if user_id not in ids:
+                    ids.append(user_id)
+                    await _save_config()
+                    await _send_lists_screen(message, f"✅ {user_id} добавлен в БС")
+                else:
+                    await _send_lists_screen(message, f"⚠️ {user_id} уже в списке")
+            except ValueError:
+                await message.answer("❌ Введите user_id (число) или @username")
+        return
+
+    elif action == "no_dedup_del":
+        try:
+            idx = int(text) - 1
+            if idx < 0:
+                raise IndexError
+            removed = _cfg().actions.no_dedup_ids.pop(idx)
+            await _save_config()
+            await _send_lists_screen(message, f"✅ {removed} удалён из БС")
+        except (ValueError, IndexError):
+            await message.answer("❌ Неверный номер.")
+        return
+
+    elif action.startswith("syn_add:"):
+        kw = action.split(":", 1)[1]
+        existing = list(_cfg().rules.keyword_map.get(kw, []))
+        new_syns = [s.strip() for s in text.split(",") if s.strip()]
+        merged = existing + [s for s in new_syns if s not in existing]
+        await _propose_keyword(message, kw, merged, is_new=False)
+        return
+
+    elif action.startswith("syn_del:"):
+        kw = action.split(":", 1)[1]
+        kmap = _cfg().rules.keyword_map
+        syns = kmap.get(kw, [])
+        try:
+            idx = int(text) - 1
+            if idx < 0:
+                raise IndexError
+            removed = syns.pop(idx)
+            await _save_config()
+            if _bot_instance.userbot:
+                _bot_instance.userbot.matcher.update(
+                    _cfg().monitoring.keywords,
+                    keyword_map=_cfg().rules.keyword_map,
+                )
+            screen_text, kb = _build_syn_show_screen(kw, f"✅ Синоним «{removed}» удалён")
+            await message.answer(screen_text, reply_markup=kb, parse_mode="HTML")
+        except (ValueError, IndexError):
+            await message.answer("❌ Неверный номер.")
+        return
+
+    elif action == "edit_dm_limit":
+        try:
+            val = int(text)
+            if val < 1:
+                raise ValueError
+            _cfg().rate_limits.dm_per_hour = val
+            await _save_config()
+            await _send_limits_screen(message, f"✅ Лимит DM: {val}/час")
+        except ValueError:
+            await message.answer("❌ Введите положительное число")
+        return
+
+    elif action == "edit_vision_limit":
+        try:
+            val = int(text)
+            if val < 1:
+                raise ValueError
+            _cfg().rate_limits.vision_per_minute = val
+            await _save_config()
+            await _send_limits_screen(message, f"✅ Лимит Vision: {val}/мин")
+        except ValueError:
+            await message.answer("❌ Введите положительное число")
+        return
+
+    elif action == "edit_nlp_limit":
+        try:
+            val = int(text)
+            if val < 1:
+                raise ValueError
+            _cfg().monitoring.text_nlp_per_minute = val
+            await _save_config()
+            await _send_limits_screen(message, f"✅ Лимит NLP: {val}/мин")
+        except ValueError:
+            await message.answer("❌ Введите положительное число")
+        return
+
+    await message.answer("Главное меню:", reply_markup=main_menu_kb())
+
+
+# ── Photo test handler ─────────────────────────────────────────────
+
+@router.message(F.photo)
+async def handle_photo_input(message: Message):
+    action = _bot_instance.awaiting.pop(message.from_user.id, None)
+    if action == "chat_add":
+        text = (message.caption or "").strip()
+        ok = await _handle_chat_add(message, fallback_text=text)
+        if not ok:
+            _bot_instance.awaiting[message.from_user.id] = "chat_add"
+            return
+        await message.answer("Главное меню:", reply_markup=main_menu_kb())
+        return
+
+    if action != "test":
+        if action:
+            _bot_instance.awaiting[message.from_user.id] = action
+        return
+
+    if not _cfg().rules.vision_enabled or not _cfg().vision.api_key:
+        await message.answer("🧪 Vision выключен или нет API key.")
+        return
+
+    await message.answer("🧪 Анализирую фото...")
+    photo = message.photo[-1]
+    file = await message.bot.download(photo)
+    image_bytes = file.read()
+
+    from bot.vision import analyse_image, build_vision_prompt, parse_vision_response
+    reply = await analyse_image(image_bytes, build_vision_prompt(_cfg().monitoring.keywords), _cfg().vision)
+    if reply:
+        result = parse_vision_response(reply)
+        if result:
+            await message.answer(f"🧪 Vision результат:\n🏷 Тип: {result['type']}\n💰 Цена: {result.get('price', '—')}")
+        else:
+            await message.answer(f"🧪 Vision ответ: НЕТ (не совпадение)\nRaw: {reply[:200]}")
+    else:
+        await message.answer("🧪 Vision API не ответил.")
+
+    await message.answer("Главное меню:", reply_markup=main_menu_kb())
+
+
+# ── Config persistence ─────────────────────────────────────────────
+
+def _write_config_sync(data: dict):
+    target = "config.json"
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
+
+
+async def _save_config():
+    try:
+        await asyncio.to_thread(_write_config_sync, _cfg().model_dump(mode="json"))
+    except Exception as e:
+        logger.error("Failed to save config: %s", e)
+
+
+# ── 💓 Heartbeat ──────────────────────────────────────────────────
+
+def seconds_until_next_hour_utc(now: datetime, hour: int) -> float:
+    """Seconds from `now` until the next `hour`:00:00 UTC occurrence.
+
+    If `now` is exactly at that hour (hour:00:00.000000), rolls forward
+    to the next day instead of returning 0 — a daily loop always sleeps
+    a positive amount and never fires twice for the same slot.
+    """
+    candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return (candidate - now).total_seconds()
+
+
+def _format_heartbeat(
+    chats_count: int,
+    new_count: int,
+    dup_count: int,
+    paused: bool,
+    authorized: bool,
+) -> str:
+    """Render the daily heartbeat digest sent to the owner.
+
+    `authorized=False` (userbot never logged in, or the auth check itself
+    failed) short-circuits to a standalone warning — the rest of the state
+    doesn't matter if monitoring isn't running at all.
+    """
+    if not authorized:
+        return (
+            "⚠️ ЮЗЕРБОТ НЕ АВТОРИЗОВАН — мониторинг стоит. "
+            "Настройки → 🔐 Авторизация"
+        )
+    text = (
+        f"💓 tg-pars: жив • юзербот ✅ • чатов {chats_count} • "
+        f"за 24ч: {new_count} находок, {dup_count} повторов"
+    )
+    if paused:
+        text += " • ⏸ пауза"
+    return text
+
+
+# ── ControlBot class ───────────────────────────────────────────────
+
+class ControlBot:
+    def __init__(self, config: Config, db: Database, dm_limiter=None, vision_limiter=None):
+        self.config = config
+        self.db = db
+        self.userbot = None  # set externally after init
+        self.awaiting: dict[int, str] = {}  # user_id -> action
+        self.pending_kw: dict[int, dict] = {}  # user_id -> {kw, synonyms, is_new}
+        self.owner_id: int | None = None   # set on first /start
+        self.dm_limiter = dm_limiter
+        self.vision_limiter = vision_limiter
+        self._heartbeat_task: asyncio.Task | None = None
+
+        self.bot = Bot(token=config.telegram.bot_token)
+        self.dp = Dispatcher()
+        self.dp.include_router(router)
+
+        global _bot_instance
+        _bot_instance = self
+
+    async def send_notification(self, text: str, matched_keyword: str = ""):
+        """Send notification to owner + extra recipients (filtered by keyword)."""
+        # Always send to owner
+        if self.owner_id:
+            try:
+                await self.bot.send_message(chat_id=self.owner_id, text=text)
+            except Exception as e:
+                logger.error("Failed to send notification to owner: %s", e)
+        else:
+            logger.info("Notification (owner unknown, send /start first): %s", text[:80])
+
+        # Send to extra recipients (with keyword filter)
+        if not matched_keyword:
+            return  # duplicates / system messages → only owner
+        kw_lower = matched_keyword.lower()
+        for r in self.config.actions.extra_notify:
+            if r.keywords and kw_lower not in [k.lower() for k in r.keywords]:
+                continue
+            try:
+                await self.bot.send_message(chat_id=r.user_id, text=text)
+            except Exception as e:
+                logger.error("Failed to send notification to %s (%s): %s", r.name or r.user_id, r.user_id, e)
+                # Fallback: try via Telethon userbot
+                if self.userbot and self.userbot.client.is_connected():
+                    try:
+                        await self.userbot.client.send_message(r.user_id, text)
+                    except Exception as e2:
+                        logger.error("Telethon fallback also failed for %s: %s", r.user_id, e2)
+
+    async def _heartbeat_authorized(self) -> bool:
+        """Best-effort auth check: missing userbot/client or any exception -> False."""
+        ub = self.userbot
+        if not ub or not ub.client:
+            return False
+        try:
+            return bool(await ub.client.is_user_authorized())
+        except Exception as e:
+            logger.error("Heartbeat: is_user_authorized check failed: %s", e)
+            return False
+
+    async def _build_heartbeat_text(self) -> str:
+        authorized = await self._heartbeat_authorized()
+        chats_count = len(self.config.monitoring.chats)
+        new_count, dup_count = await self.db.count_matches_since(24)
+        paused = bool(self.userbot and self.userbot.paused)
+        return _format_heartbeat(chats_count, new_count, dup_count, paused, authorized)
+
+    async def _heartbeat_loop(self):
+        """Once a day at heartbeat_hour_utc UTC, DM the owner a status digest.
+
+        Mirrors main.py's retention_loop shape (infinite loop, sleep, guarded
+        work), but waits for owner_id to be captured first since it starts
+        together with the control bot — before /start may have run.
+        """
+        while self.owner_id is None:
+            await asyncio.sleep(60)
+        while True:
+            wait = seconds_until_next_hour_utc(
+                datetime.now(timezone.utc), self.config.actions.heartbeat_hour_utc
+            )
+            await asyncio.sleep(wait)
+            try:
+                text = await self._build_heartbeat_text()
+                await self.bot.send_message(chat_id=self.owner_id, text=text)
+            except Exception:
+                logger.error("Heartbeat job failed", exc_info=True)
+
+    async def start(self):
+        logger.info("Control bot starting...")
+        saved = await self.db.get_setting("owner_id")
+        if saved:
+            self.owner_id = int(saved)
+            logger.info("Loaded owner_id=%s from DB", saved)
+            try:
+                await self.bot.send_message(
+                    self.owner_id,
+                    "✅ Бот перезапущен и готов к работе.\nНажмите /start для меню.",
+                )
+            except Exception:
+                pass
+        if self.config.actions.heartbeat_enabled:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        await self.dp.start_polling(self.bot, handle_signals=False)
+
+    async def stop(self):
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        await self.dp.stop_polling()
+        await self.bot.session.close()
+        logger.info("Control bot stopped")
