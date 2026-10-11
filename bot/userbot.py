@@ -545,11 +545,17 @@ class Userbot:
             )
 
         delivered = await self._notify_new(meta, dm_sent, forward_sent)
-        # Недоставленное повтором не считается: delivered=0 окно не открывает
+        # Недоставленное повтором не считается: delivered=0 окно не открывает.
+        # dry-run ничего не отправляет (пересылка «как будто» успешна) — доставкой не считаем,
+        # иначе после выключения dry-run объявление молча подавится как повтор.
+        dry_run = self.config.actions.dry_run
+        if dry_run:
+            delivered = False
         await self.db.add_notified(
             seller_id, matched_value, verdict.text_fp, price, msg.chat_id, msg.id,
             delivered=delivered, suppressed=False,
-            reason="price_drop" if verdict.price_drop_from else ("" if delivered else "undelivered"),
+            reason="price_drop" if verdict.price_drop_from else (
+                "" if delivered else ("dry_run" if dry_run else "undelivered")),
         )
 
     async def _drop_early(self, msg: Message, seller_id: int, reason: str):

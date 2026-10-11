@@ -202,6 +202,25 @@ async def test_undelivered_is_not_a_repeat(h, db):
     assert len(h.sent) == 2
 
 
+@pytest.mark.parametrize("forward", [False, True])
+async def test_dry_run_is_not_delivery(h, cfg, db, forward):
+    """dry-run ничего не отправляет: запись delivered=0, после выключения dry-run объявление уведомляется."""
+    cfg.actions.dry_run = True
+    cfg.actions.forward_to_main_bot = forward
+    await h.run(FakeMsg(TEXT))
+    await h.run(FakeMsg(TEXT))                    # и в dry-run повтор не подавляется
+    rows = await _notified(db)
+    assert [(r["delivered"], r["suppressed"], r["reason"]) for r in rows] == [(0, 0, "dry_run")] * 2
+
+    cfg.actions.dry_run = False
+    sent_before = len(h.sent)
+    await h.run(FakeMsg(TEXT))
+    assert len(h.sent) == sent_before + 1         # не подавлено как повтор
+    assert (await _notified(db))[-1]["delivered"] == 1
+    await h.run(FakeMsg(TEXT))                    # теперь настоящий повтор
+    assert len(h.sent) == sent_before + 1
+
+
 async def test_two_crossposts_at_once_give_one_notification(h, db):
     started = asyncio.Event()
     orig = h.ub.notify
