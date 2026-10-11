@@ -22,7 +22,7 @@
   },
   "actions": {
     "notify_chat_id": "me",
-    "auto_dm": true,
+    "auto_dm": false,
     "forward_to_main_bot": false,
     "forward_mode": "notify_with_meta",
     "dm_template": "Привет! {type} ещё доступна? Цена: {price}. Ссылка: {link}",
