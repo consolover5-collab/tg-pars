@@ -12,7 +12,8 @@
     "max_price": 30000,
     "vision_require_listing_signal": true,
     "use_text_nlp": false,
-    "text_nlp_per_minute": 3
+    "text_nlp_per_minute": 3,
+    "dedup_window_days": 7
   },
   "vision": {
     "provider": "groq",

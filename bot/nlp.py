@@ -8,9 +8,7 @@ import json
 import logging
 import re
 
-import aiohttp
-
-from bot.http import post_with_retry
+from bot.llm import get_client
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +69,7 @@ async def analyse_text(
     targets: list[str],
     config,
     limiter=None,
+    llm=None,
 ) -> dict | None:
     """Analyse text with Groq: returns {match, type, price, dm} or None on error/skip.
 
@@ -79,8 +78,13 @@ async def analyse_text(
         targets: what the buyer is looking for (e.g. ["колонка", "телевизор"])
         config: Config object (uses vision.api_key / vision.base_url)
         limiter: RateLimiter instance (uses text_nlp_per_minute budget)
+        llm: LLMClient (по умолчанию — общий клиент процесса)
     """
     if not text or not text.strip():
+        return None
+    llm = llm or get_client(config.vision)
+    if llm.is_blocked():
+        llm.note_skip()
         return None
     if limiter and not limiter.consume():
         logger.debug("NLP rate limit hit, skipping text analysis")
@@ -92,34 +96,21 @@ async def analyse_text(
         f"Объявление:\n{text[:800]}"
     )
 
-    payload = {
-        "model": config.vision.model,
-        "messages": [
+    raw = await llm.chat(
+        [
             {"role": "system", "content": _DEFAULT_SYSTEM},
             {"role": "user", "content": user_prompt},
         ],
-        "max_tokens": 256,
-        "temperature": 0.3,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {config.vision.api_key}",
-        "Content-Type": "application/json",
-    }
+        max_tokens=256,
+        temperature=0.3,
+        kind="nlp",
+        timeout=20.0,
+    )
+    if raw is None:
+        return None
 
     try:
-        async with post_with_retry(
-            config.vision.base_url,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            if resp.status != 200:
-                logger.warning("Groq NLP returned %d", resp.status)
-                return None
-            data = await resp.json()
-
-        raw = data["choices"][0]["message"]["content"].strip()
+        raw = raw.strip()
         # Strip markdown code fences if model adds them
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
         result = json.loads(raw)
@@ -130,7 +121,7 @@ async def analyse_text(
             "dm": str(result.get("dm") or ""),
         }
     except (json.JSONDecodeError, KeyError) as e:
-        logger.warning("Groq NLP parse error: %s | raw: %s", e, raw if 'raw' in dir() else "")
+        logger.warning("Groq NLP parse error: %s | raw: %s", e, raw)
         return None
     except Exception as e:
         logger.error("Groq NLP request failed: %s", e)
@@ -142,6 +133,7 @@ async def generate_dm(
     item_type: str,
     config,
     price: int | None = None,
+    llm=None,
 ) -> str | None:
     """Generate a personalised DM for a keyword-matched listing (no NLP step).
 
@@ -157,33 +149,18 @@ async def generate_dm(
     )
     user = f"Товар: {item_type}.\nЦена: {price_str}.\nТекст объявления:\n{listing_text[:600]}"
 
-    payload = {
-        "model": config.vision.model,
-        "messages": [
+    llm = llm or get_client(config.vision)
+    reply = await llm.chat(
+        [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "max_tokens": 120,
-        "temperature": 0.7,
-    }
-    headers = {
-        "Authorization": f"Bearer {config.vision.api_key}",
-        "Content-Type": "application/json",
-    }
-    try:
-        async with post_with_retry(
-            config.vision.base_url,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error("Groq DM generation failed: %s", e)
-        return None
+        max_tokens=120,
+        temperature=0.7,
+        kind="dm",
+        timeout=20.0,
+    )
+    return reply.strip() if reply else None
 
 
 async def classify_user_input(text: str, config) -> dict:
@@ -206,32 +183,22 @@ async def classify_user_input(text: str, config) -> dict:
         "\"synonyms\": [\"синоним1\", \"синоним2\"]}\n"
         "Для неизвестного: {\"type\": \"unknown\"}"
     )
-    payload = {
-        "model": config.vision.model,
-        "messages": [
+    llm = get_client(config.vision)
+    raw = await llm.chat(
+        [
             {"role": "system", "content": system},
             {"role": "user", "content": text[:300]},
         ],
-        "max_tokens": 150,
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }
-    headers = {
-        "Authorization": f"Bearer {config.vision.api_key}",
-        "Content-Type": "application/json",
-    }
+        max_tokens=150,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        kind="menu",
+        timeout=15.0,
+    )
+    if raw is None:
+        return {"type": "unknown"}
     try:
-        async with post_with_retry(
-            config.vision.base_url,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status != 200:
-                return {"type": "unknown"}
-            data = await resp.json()
-        raw = data["choices"][0]["message"]["content"].strip()
-        result = json.loads(raw)
+        result = json.loads(raw.strip())
         return result if isinstance(result, dict) and "type" in result else {"type": "unknown"}
     except Exception as e:
         logger.error("classify_user_input failed: %s", e)
@@ -250,24 +217,19 @@ async def expand_synonyms(keyword: str, existing: list, config) -> list:
         "Если добавить нечего — {\"synonyms\": []}."
     )
     user = f"Товар: {keyword}\nУже есть: {existing_str}"
-    payload = {
-        "model": config.vision.model,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "max_tokens": 150,
-        "temperature": 0.7,
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Authorization": f"Bearer {config.vision.api_key}", "Content-Type": "application/json"}
+    llm = get_client(config.vision)
+    raw = await llm.chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=150,
+        temperature=0.7,
+        response_format={"type": "json_object"},
+        kind="menu",
+        timeout=15.0,
+    )
+    if raw is None:
+        return []
     try:
-        async with post_with_retry(
-            config.vision.base_url, json=payload, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status != 200:
-                return []
-            data = await resp.json()
-        raw = data["choices"][0]["message"]["content"].strip()
-        result = json.loads(raw)
+        result = json.loads(raw.strip())
         new_syns = result.get("synonyms", [])
         seen = {s.lower() for s in existing} | {keyword.lower()}
         out = []

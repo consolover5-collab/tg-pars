@@ -22,6 +22,7 @@ class MonitoringConfig(BaseModel):
     vision_require_listing_signal: bool = True  # only Vision-analyse photos that look like listings
     use_text_nlp: bool = False   # Groq text NLP for semantic matching
     text_nlp_per_minute: int = 3  # max Groq NLP calls per minute
+    dedup_window_days: int = 7  # одно и то же объявление от продавца повторно не уведомляем
 
 
 class VisionConfig(BaseModel):

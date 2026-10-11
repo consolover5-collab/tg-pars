@@ -19,6 +19,7 @@ from aiogram.types import (
 )
 
 from bot.models import Config
+from bot.llm import describe_downtime
 from bot.nlp import classify_user_input, expand_synonyms
 from db.database import Database
 
@@ -1180,9 +1181,16 @@ async def cb_help(callback: CallbackQuery):
         "• Вкл/выкл автоматической отправки сообщений продавцам\n"
         "• <b>Шаблон</b> — переменные: <code>{type}</code> <code>{price}</code> <code>{link}</code>\n"
         "• <b>Задержка</b> — случайная пауза перед отправкой (имитация живого)\n"
-        "• <b>Повтор</b> — cooldown: через N часов можно написать снова\n"
+        "• <b>Повтор</b> — cooldown DM: через N часов можно написать снова (уведомления о новых объявлениях он не скрывает)\n"
         "• <b>Dry-run</b> — тестовый режим: находки видны, DM не отправляются\n"
         "• <b>Groq DM</b> — AI-генерация персонализированных сообщений\n\n"
+
+        "<b>🔕 Повторы и скам</b>\n"
+        "• То же объявление от того же продавца за 7 дней приходит один раз "
+        "(кросспост в нескольких чатах не плодит уведомления); цена ниже прежней — "
+        "с пометкой «📉 цена снижена»\n"
+        "• Списки «распродажа, фото и цены в личку» и сообщения из чёрного списка отсеиваются молча; "
+        "счётчики — в ежедневном heartbeat\n\n"
 
         "<b>📋 История</b>\n"
         "• <b>Все находки</b> — последние совпадения с ценой и типом\n"
@@ -1218,7 +1226,7 @@ async def cb_help(callback: CallbackQuery):
 # ── Limits ─────────────────────────────────────────────────────────
 
 def _build_limits_screen(status_line: str = "") -> tuple[str, InlineKeyboardMarkup]:
-    from bot.vision import _groq_rate_info
+    from bot.llm import rate_info as _groq_rate_info
 
     cfg = _cfg()
     dm = _bot_instance.dm_limiter
@@ -1248,6 +1256,11 @@ def _build_limits_screen(status_line: str = "") -> tuple[str, InlineKeyboardMark
         )
     else:
         groq_lines = "\n🌐 <b>Groq API</b>: нет данных (Vision ещё не вызывался)"
+
+    ub = _bot_instance.userbot
+    if ub and ub.llm.blocked_until():
+        until = datetime.fromtimestamp(ub.llm.blocked_until(), timezone.utc).strftime("%H:%M")
+        groq_lines += f"\n  ⛔ Дневной лимит исчерпан, пауза до {until} UTC"
 
     parts = [f"📊 <b>Лимиты</b>\n"]
     if status_line:
@@ -1919,6 +1932,7 @@ async def handle_text_input(message: Message):
             if val < 1:
                 raise ValueError
             _cfg().rate_limits.dm_per_hour = val
+            _bot_instance.apply_limits()
             await _save_config()
             await _send_limits_screen(message, f"✅ Лимит DM: {val}/час")
         except ValueError:
@@ -1931,6 +1945,7 @@ async def handle_text_input(message: Message):
             if val < 1:
                 raise ValueError
             _cfg().rate_limits.vision_per_minute = val
+            _bot_instance.apply_limits()
             await _save_config()
             await _send_limits_screen(message, f"✅ Лимит Vision: {val}/мин")
         except ValueError:
@@ -1943,6 +1958,7 @@ async def handle_text_input(message: Message):
             if val < 1:
                 raise ValueError
             _cfg().monitoring.text_nlp_per_minute = val
+            _bot_instance.apply_limits()
             await _save_config()
             await _send_limits_screen(message, f"✅ Лимит NLP: {val}/мин")
         except ValueError:
@@ -2034,22 +2050,40 @@ def _format_heartbeat(
     dup_count: int,
     paused: bool,
     authorized: bool,
+    *,
+    repeat_count: int | None = None,
+    scam_count: int = 0,
+    blocklist_count: int = 0,
+    groq_line: str = "",
 ) -> str:
     """Render the daily heartbeat digest sent to the owner.
 
     `authorized=False` (userbot never logged in, or the auth check itself
     failed) short-circuits to a standalone warning — the rest of the state
     doesn't matter if monitoring isn't running at all.
+
+    `repeat_count` (из таблицы notified) заменяет счётчик повторов из matches;
+    None — прежний формат.
     """
     if not authorized:
         return (
             "⚠️ ЮЗЕРБОТ НЕ АВТОРИЗОВАН — мониторинг стоит. "
             "Настройки → 🔐 Авторизация"
         )
+    if repeat_count is None:
+        found = f"{new_count} находок, {dup_count} повторов"
+    else:
+        found = f"{new_count} находок • отсеяно повторов: {repeat_count}"
     text = (
         f"💓 tg-pars: жив • юзербот ✅ • чатов {chats_count} • "
-        f"за 24ч: {new_count} находок, {dup_count} повторов"
+        f"за 24ч: {found}"
     )
+    if scam_count:
+        text += f" • скам отсеян: {scam_count}"
+    if blocklist_count:
+        text += f" • из ЧС отсеяно: {blocklist_count}"
+    if groq_line:
+        text += f" • {groq_line}"
     if paused:
         text += " • ⏸ пауза"
     return text
@@ -2076,12 +2110,26 @@ class ControlBot:
         global _bot_instance
         _bot_instance = self
 
-    async def send_notification(self, text: str, matched_keyword: str = ""):
-        """Send notification to owner + extra recipients (filtered by keyword)."""
+    def apply_limits(self):
+        """Лимиты из меню вступают в силу сразу: обновить max_tokens живых лимитеров."""
+        if self.dm_limiter:
+            self.dm_limiter.max_tokens = self.config.rate_limits.dm_per_hour
+        if self.vision_limiter:
+            self.vision_limiter.max_tokens = self.config.rate_limits.vision_per_minute
+        if self.userbot:
+            self.userbot.apply_rate_limits()
+
+    async def send_notification(self, text: str, matched_keyword: str = "") -> bool:
+        """Send notification to owner + extra recipients (filtered by keyword).
+
+        True — сообщение дошло владельцу (получатели из extra_notify на результат не влияют).
+        """
+        delivered = False
         # Always send to owner
         if self.owner_id:
             try:
                 await self.bot.send_message(chat_id=self.owner_id, text=text)
+                delivered = True
             except Exception as e:
                 logger.error("Failed to send notification to owner: %s", e)
         else:
@@ -2089,7 +2137,7 @@ class ControlBot:
 
         # Send to extra recipients (with keyword filter)
         if not matched_keyword:
-            return  # duplicates / system messages → only owner
+            return delivered  # system messages → only owner
         kw_lower = matched_keyword.lower()
         for r in self.config.actions.extra_notify:
             if r.keywords and kw_lower not in [k.lower() for k in r.keywords]:
@@ -2104,6 +2152,7 @@ class ControlBot:
                         await self.userbot.client.send_message(r.user_id, text)
                     except Exception as e2:
                         logger.error("Telethon fallback also failed for %s: %s", r.user_id, e2)
+        return delivered
 
     async def _heartbeat_authorized(self) -> bool:
         """Best-effort auth check: missing userbot/client or any exception -> False."""
@@ -2121,7 +2170,15 @@ class ControlBot:
         chats_count = len(self.config.monitoring.chats)
         new_count, dup_count = await self.db.count_matches_since(24)
         paused = bool(self.userbot and self.userbot.paused)
-        return _format_heartbeat(chats_count, new_count, dup_count, paused, authorized)
+        dropped = await self.db.count_notified_since(24)
+        groq_line = describe_downtime(self.userbot.llm.daily_stats()) if self.userbot else ""
+        return _format_heartbeat(
+            chats_count, new_count, dup_count, paused, authorized,
+            repeat_count=dropped.get("repeat", 0),
+            scam_count=dropped.get("scam", 0),
+            blocklist_count=dropped.get("blocklist", 0),
+            groq_line=groq_line,
+        )
 
     async def _heartbeat_loop(self):
         """Once a day at heartbeat_hour_utc UTC, DM the owner a status digest.

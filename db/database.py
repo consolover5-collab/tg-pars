@@ -1,6 +1,14 @@
 import aiosqlite
 import os
 import json
+from datetime import datetime, timezone
+
+TS_FORMAT = "%Y-%m-%d %H:%M:%S"  # как datetime('now') в SQLite
+
+
+def format_ts(moment: datetime | None = None) -> str:
+    """UTC-момент в формате колонок created_at (по умолчанию — сейчас)."""
+    return (moment or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime(TS_FORMAT)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_sellers (
@@ -55,6 +63,21 @@ CREATE TABLE IF NOT EXISTS actions_log (
     details     TEXT,
     FOREIGN KEY (message_id) REFERENCES messages(id)
 );
+
+CREATE TABLE IF NOT EXISTS notified (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id   INTEGER NOT NULL,
+    item        TEXT,
+    text_fp     TEXT NOT NULL DEFAULT '',
+    price       INTEGER,
+    chat_id     INTEGER,
+    message_id  INTEGER,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    delivered   INTEGER NOT NULL DEFAULT 0,
+    suppressed  INTEGER NOT NULL DEFAULT 0,
+    reason      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_notified_seller_fp ON notified (seller_id, text_fp, created_at);
 """
 
 
@@ -256,7 +279,8 @@ class Database:
             return result
 
     async def prune_old_rows(
-        self, messages_days: int = 30, actions_days: int = 30, matches_days: int = 90
+        self, messages_days: int = 30, actions_days: int = 30, matches_days: int = 90,
+        notified_days: int = 30,
     ) -> dict[str, int]:
         """Удалить старые строки (retention) и освободить место.
 
@@ -280,6 +304,11 @@ class Database:
             (f"-{matches_days} days",),
         )
         counts["matches"] = cur.rowcount
+        cur = await self._db.execute(
+            "DELETE FROM notified WHERE datetime(created_at) < datetime('now', ?)",
+            (f"-{notified_days} days",),
+        )
+        counts["notified"] = cur.rowcount
         await self._db.commit()
         await self._db.execute("VACUUM")
         return counts
@@ -296,3 +325,44 @@ class Database:
             row = await cur.fetchone()
         return (row[0] or 0, row[1] or 0)
 
+    # ── Учёт уведомлений (повторы, скам) ───────────────────────────────
+
+    async def add_notified(
+        self, seller_id: int, item: str | None, text_fp: str, price: int | None,
+        chat_id: int | None, message_id: int | None, *,
+        delivered: bool, suppressed: bool, reason: str = "",
+        created_at: str | None = None,
+    ) -> int:
+        """Записать итог по сообщению: дошло ли владельцу или почему отсеяно."""
+        cur = await self._db.execute(
+            "INSERT INTO notified (seller_id, item, text_fp, price, chat_id, message_id, "
+            "created_at, delivered, suppressed, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (seller_id, item, text_fp, price, chat_id, message_id,
+             created_at or format_ts(), int(delivered), int(suppressed), reason),
+        )
+        await self._db.commit()
+        return cur.lastrowid
+
+    async def find_delivered_notification(
+        self, seller_id: int, text_fp: str, since: str
+    ) -> dict | None:
+        """Последнее доставленное (не подавленное) уведомление продавца с тем же текстом
+        не старше `since` (формат TS_FORMAT). Подавленные повторы окно не продлевают."""
+        async with self._db.execute(
+            "SELECT * FROM notified WHERE seller_id = ? AND text_fp = ? "
+            "AND delivered = 1 AND suppressed = 0 AND created_at >= ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (seller_id, text_fp, since),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def count_notified_since(self, hours: int) -> dict[str, int]:
+        """Сколько отсеяно за последние `hours` часов по причинам: {'repeat': n, 'scam': n, ...}."""
+        async with self._db.execute(
+            "SELECT reason, COUNT(*) FROM notified "
+            "WHERE suppressed = 1 AND datetime(created_at) >= datetime('now', ?) GROUP BY reason",
+            (f"-{hours} hours",),
+        ) as cur:
+            rows = await cur.fetchall()
+        return {r[0]: r[1] for r in rows}
